@@ -2,7 +2,8 @@
 Plotly-based interactive charts for clustering, anomalies, and feature views.
 
 This module stays independent of Streamlit; callers choose ``theme`` to match
-the host application's light or dark UI.
+the host application's light or dark UI. Correlation views use
+:class:`processor.DataLoader` so numeric columns match the ingestion layer.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.graph_objects import Figure
+
+from processor import DataLoader
 
 
 class DataVisualizer:
@@ -254,4 +257,125 @@ class DataVisualizer:
             )
             fig.update_xaxes(tickangle=-35)
 
+        return fig
+
+    def plot_elbow_curve(
+        self,
+        elbow_df: pd.DataFrame,
+        *,
+        selected_k: int | None = None,
+    ) -> Figure:
+        """Line chart of K-Means inertia vs k (elbow method).
+
+        Args:
+            elbow_df: Data frame with columns ``k`` and ``inertia`` (e.g. from
+                :meth:`ai_engine.AIEngine.elbow_inertia_scan`).
+            selected_k: When set, draws a vertical dashed line at this cluster
+                count to relate the plot to the user's K-Means setting.
+
+        Returns:
+            Themed Plotly figure.
+
+        Raises:
+            ValueError: If required columns are missing or the frame is empty.
+        """
+        if not isinstance(elbow_df, pd.DataFrame) or elbow_df.empty:
+            raise ValueError("elbow_df must be a non-empty DataFrame.")
+        if not {"k", "inertia"}.issubset(set(elbow_df.columns)):
+            raise ValueError("elbow_df must contain columns 'k' and 'inertia'.")
+
+        fig = px.line(
+            elbow_df,
+            x="k",
+            y="inertia",
+            markers=True,
+            color_discrete_sequence=["#7C3AED"],
+        )
+        fig.update_traces(line=dict(width=2), marker=dict(size=8))
+        fig.update_layout(
+            **self._base_layout(
+                "Dirsek yöntemi: K vs inertia (WCSS, ölçeklenmiş uzayda)",
+                xaxis_title="k (küme sayısı)",
+                yaxis_title="Inertia (küme içi kare uzaklık toplamı)",
+            )
+        )
+        if selected_k is not None and selected_k >= 1:
+            fig.add_vline(
+                x=float(selected_k),
+                line_width=2,
+                line_dash="dash",
+                line_color="#EA580C",
+                annotation_text=f"Seçilen k = {selected_k}",
+                annotation_position="top right",
+            )
+        return fig
+
+    def plot_correlation_heatmap(
+        self,
+        df: pd.DataFrame,
+        numeric_columns: list[str] | None = None,
+    ) -> Figure:
+        """Pearson correlation heatmap for numeric columns.
+
+        Args:
+            df: Source table.
+            numeric_columns: Columns to include; if ``None``, all columns that
+                :meth:`processor.DataLoader.infer_column_types` marks as numeric
+                are used. Non-numeric names are dropped so the heatmap uses only
+                model-aligned numeric features.
+
+        Returns:
+            ``Figure`` with diverging colors around zero correlation.
+
+        Raises:
+            ValueError: If fewer than two numeric columns are available after
+                selection.
+        """
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("df must be a pandas DataFrame.")
+
+        inferred_numeric, _ = DataLoader.infer_column_types(df)
+        inferred_set = set(inferred_numeric)
+
+        if numeric_columns is not None:
+            missing = set(numeric_columns) - set(df.columns)
+            if missing:
+                raise ValueError(f"Unknown columns: {sorted(missing)}")
+            cols = [c for c in numeric_columns if c in inferred_set]
+        else:
+            cols = [c for c in inferred_numeric if c in df.columns]
+
+        if len(cols) < 2:
+            raise ValueError(
+                "At least two inferred numeric columns are required for a "
+                "correlation heatmap."
+            )
+
+        sub = df[cols].apply(pd.to_numeric, errors="coerce")
+        corr = sub.corr(numeric_only=True, method="pearson")
+        if corr.shape[0] < 2:
+            raise ValueError("Correlation matrix is too small to display.")
+
+        fig = px.imshow(
+            corr,
+            aspect="equal",
+            color_continuous_scale="RdBu_r",
+            zmin=-1.0,
+            zmax=1.0,
+            labels=dict(color="Pearson r"),
+        )
+        fig.update_traces(
+            texttemplate="%{z:.2f}",
+            textfont={"size": 11},
+            hovertemplate="x=%{x}<br>y=%{y}<br>r=%{z:.2f}<extra></extra>",
+        )
+        fig.update_layout(
+            **self._base_layout(
+                "Korelasyon matrisi (Pearson)",
+                xaxis_title="",
+                yaxis_title="",
+                height=560,
+            )
+        )
+        fig.update_xaxes(side="bottom")
         return fig

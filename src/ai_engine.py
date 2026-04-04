@@ -8,13 +8,14 @@ so the same features drive statistics, cleaning, and modeling.
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final
 
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
+from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 from exceptions import AIModelError
@@ -41,11 +42,17 @@ class AIEngine:
         """
         self._random_state: Final[int] = random_state
 
-    def _prepare_data(self, df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
+    def _prepare_data(
+        self,
+        df: pd.DataFrame,
+        numeric_columns: list[str] | None = None,
+    ) -> tuple[np.ndarray, list[str]]:
         """Select numeric columns, coerce values, impute missing values, and scale.
 
         Uses ``DataLoader.infer_column_types`` so numeric detection matches the
-        ingestion layer (including numeric-like strings).
+        ingestion layer (including numeric-like strings). When
+        ``numeric_columns`` is set, only those names are used (must be a subset
+        of inferred numeric columns).
 
         Returns:
             A tuple ``(X_scaled, numeric_column_names)`` where ``X_scaled`` is a
@@ -61,15 +68,35 @@ class AIEngine:
             raise AIModelError("Input DataFrame is empty.")
 
         try:
-            numeric_cols, _ = DataLoader.infer_column_types(df)
-            if not numeric_cols:
+            inferred_numeric, _ = DataLoader.infer_column_types(df)
+            if not inferred_numeric:
                 raise AIModelError(
                     "No numeric columns found. Ensure the dataset has numeric "
                     "features or numeric-like text columns after cleaning."
                 )
 
-            X_frame = df[numeric_cols].copy()
-            for col in numeric_cols:
+            if numeric_columns is not None:
+                if not numeric_columns:
+                    raise AIModelError(
+                        "At least one numeric column must be selected for analysis."
+                    )
+                missing_names = set(numeric_columns) - set(df.columns)
+                if missing_names:
+                    raise AIModelError(
+                        f"Unknown columns (not in DataFrame): {sorted(missing_names)}"
+                    )
+                bad = [c for c in numeric_columns if c not in inferred_numeric]
+                if bad:
+                    raise AIModelError(
+                        "These columns are not treated as numeric for modeling: "
+                        + ", ".join(bad)
+                    )
+                use_cols = list(numeric_columns)
+            else:
+                use_cols = inferred_numeric
+
+            X_frame = df[use_cols].copy()
+            for col in use_cols:
                 if not pd.api.types.is_numeric_dtype(X_frame[col]):
                     X_frame[col] = pd.to_numeric(X_frame[col], errors="coerce")
 
@@ -87,20 +114,71 @@ class AIEngine:
         except Exception as exc:
             raise AIModelError(f"Data preparation failed: {exc}") from exc
 
-        return X_scaled, numeric_cols
+        return X_scaled, use_cols
+
+    def elbow_inertia_scan(
+        self,
+        df: pd.DataFrame,
+        k_max: int = 10,
+        numeric_columns: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """Compute K-Means inertia (within-cluster sum of squares) for k = 1 … k_max.
+
+        Used for the elbow method: plot ``k`` vs ``inertia`` and look for an
+        "elbow" where marginal gains shrink.
+
+        Args:
+            df: Input table.
+            k_max: Largest k to try; capped by row count and feature count.
+            numeric_columns: Optional subset of inferred numeric columns.
+
+        Returns:
+            DataFrame with columns ``k`` and ``inertia`` (float).
+
+        Raises:
+            AIModelError: If preparation fails or no valid k range.
+        """
+        if k_max < 1:
+            raise AIModelError("k_max must be at least 1.")
+
+        X, _ = self._prepare_data(df, numeric_columns=numeric_columns)
+        n_samples = int(X.shape[0])
+        upper = min(k_max, n_samples)
+        if upper < 1:
+            raise AIModelError("Not enough rows for elbow scan.")
+
+        rows: list[tuple[int, float]] = []
+        for k in range(1, upper + 1):
+            model = KMeans(
+                n_clusters=k,
+                random_state=self._random_state,
+                n_init=10,
+            )
+            model.fit(X)
+            rows.append((k, float(model.inertia_)))
+
+        return pd.DataFrame(rows, columns=["k", "inertia"])
 
     def perform_clustering(
-        self, df: pd.DataFrame, n_clusters: int = 3
-    ) -> np.ndarray:
+        self,
+        df: pd.DataFrame,
+        n_clusters: int = 3,
+        numeric_columns: list[str] | None = None,
+    ) -> tuple[np.ndarray, float, float | None]:
         """Partition rows into ``n_clusters`` groups using K-Means on scaled data.
 
         Args:
-            df: Input table; only inferred numeric columns are used.
+            df: Input table; inferred numeric columns are used, or ``numeric_columns``
+                if provided.
             n_clusters: Number of clusters (>= 1 and at most the row count).
+            numeric_columns: Optional subset of inferred numeric column names.
 
         Returns:
-            Integer cluster label per row, shape ``(n_samples,)``, aligned with
-            ``df.index``.
+            ``(labels, inertia, silhouette)`` where ``labels`` has shape ``(n_samples,)``
+            aligned with ``df.index``, ``inertia`` is the K-Means WCSS on the **scaled**
+            matrix, and ``silhouette`` is the mean Silhouette score (Euclidean on the
+            same scaled data) when ``k >= 2`` and labels split into at least two
+            clusters; otherwise ``None``.
 
         Raises:
             AIModelError: If arguments are invalid or K-Means fails to fit.
@@ -109,7 +187,7 @@ class AIEngine:
             raise AIModelError("n_clusters must be at least 1.")
 
         try:
-            X, _ = self._prepare_data(df)
+            X, _ = self._prepare_data(df, numeric_columns=numeric_columns)
             n_samples = int(X.shape[0])
             if n_clusters > n_samples:
                 raise AIModelError(
@@ -123,26 +201,55 @@ class AIEngine:
                 n_init=10,
             )
             labels = model.fit_predict(X)
+            inertia = float(model.inertia_)
+
+            silhouette: float | None = None
+            if n_clusters >= 2 and n_samples >= 2:
+                uniq = int(len(np.unique(labels)))
+                if uniq >= 2:
+                    try:
+                        silhouette = float(
+                            silhouette_score(
+                                X,
+                                labels,
+                                metric="euclidean",
+                                random_state=self._random_state,
+                            )
+                        )
+                    except ValueError:
+                        silhouette = None
         except AIModelError:
             raise
         except Exception as exc:
             raise AIModelError(f"Clustering failed: {exc}") from exc
 
-        return np.asarray(labels, dtype=np.int32)
+        return np.asarray(labels, dtype=np.int32), inertia, silhouette
 
     def perform_pca(
-        self, df: pd.DataFrame, n_components: int = 2
-    ) -> pd.DataFrame:
+        self,
+        df: pd.DataFrame,
+        n_components: int = 2,
+        numeric_columns: list[str] | None = None,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
         """Linearly project scaled numeric data onto principal components.
 
         Args:
             df: Input table; only inferred numeric columns are used.
             n_components: Number of components; cannot exceed
                 ``min(n_samples, n_features)``.
+            numeric_columns: Optional subset of inferred numeric column names.
 
         Returns:
-            Data frame with columns ``PC1`` … ``PC{n}``, index aligned with
-            ``df.index``.
+            A pair ``(coordinates_df, variance_info)``. The frame has columns
+            ``PC1`` … ``PC{n}``, index aligned with ``df.index``. ``variance_info``
+            contains:
+
+            * ``explained_variance_ratio`` — ``numpy.ndarray``, per-component share
+              of total variance in scaled feature space.
+            * ``cumulative_variance_ratio`` — sum of ratios for the fitted components
+              (fraction of variance captured by this subspace).
+            * ``variance_explained_pct`` — ``100 * cumulative_variance_ratio`` for
+              UI labels (“% of variance along retained PCs”).
 
         Raises:
             AIModelError: If ``n_components`` is invalid or PCA fails.
@@ -151,7 +258,7 @@ class AIEngine:
             raise AIModelError("n_components must be at least 1.")
 
         try:
-            X, _ = self._prepare_data(df)
+            X, _ = self._prepare_data(df, numeric_columns=numeric_columns)
             n_samples, n_features = X.shape
             max_components = int(min(n_samples, n_features))
             if n_components > max_components:
@@ -171,15 +278,25 @@ class AIEngine:
                 columns=column_names,
                 index=df.index,
             )
+            evr = np.asarray(model.explained_variance_ratio_, dtype=np.float64)
+            cumulative = float(np.sum(evr))
+            variance_info: dict[str, Any] = {
+                "explained_variance_ratio": evr,
+                "cumulative_variance_ratio": cumulative,
+                "variance_explained_pct": float(100.0 * cumulative),
+            }
         except AIModelError:
             raise
         except Exception as exc:
             raise AIModelError(f"PCA failed: {exc}") from exc
 
-        return result
+        return result, variance_info
 
     def detect_anomalies(
-        self, df: pd.DataFrame, contamination: float = 0.1
+        self,
+        df: pd.DataFrame,
+        contamination: float = 0.1,
+        numeric_columns: list[str] | None = None,
     ) -> np.ndarray:
         """Flag outliers using Isolation Forest on scaled numeric features.
 
@@ -187,6 +304,7 @@ class AIEngine:
             df: Input table; only inferred numeric columns are used.
             contamination: Expected proportion of anomalies in ``(0.0, 0.5]``
                 as required by scikit-learn.
+            numeric_columns: Optional subset of inferred numeric column names.
 
         Returns:
             Per-row predictions: ``-1`` anomaly (outlier), ``1`` normal
@@ -203,7 +321,7 @@ class AIEngine:
             )
 
         try:
-            X, _ = self._prepare_data(df)
+            X, _ = self._prepare_data(df, numeric_columns=numeric_columns)
             model = IsolationForest(
                 contamination=contamination,
                 random_state=self._random_state,

@@ -258,3 +258,66 @@ class DataLoader:
                 out[col] = series.astype("object").fillna("Unknown")
 
         return out
+
+    @staticmethod
+    def compute_fill_quality_metrics(
+        raw: pd.DataFrame,
+        cleaned: pd.DataFrame | None = None,
+    ) -> dict[str, float | int]:
+        """
+        Measure overall missingness and how many cells were filled by cleaning.
+
+        Doluluk oranı: payda tüm hücre sayısı (satır × sütun). Eksik hücreler
+        ham verideki NaN sayımıdır. ``cleaned`` verildiğinde, hamda eksik olup
+        temizlenmiş tabloda dolu olan hücre sayısı otomatik doldurma (ortalama,
+        mod, ``Unknown`` vb.) ile kapatılmış kabul edilir.
+
+        Parameters
+        ----------
+        raw
+            Ham yükleme çıktısı.
+        cleaned
+            :meth:`clean_data` çıktısı; ``None`` ise sadece ham eksiklik raporu
+            üretilir.
+
+        Returns
+        -------
+        dict[str, float | int]
+            ``total_cells``, ``missing_cells``, ``fill_ratio`` (0–1),
+            ``missing_ratio`` (0–1), ``pct_missing``, ``pct_filled`` (doluluk %),
+            ``imputed_cells`` (temizleme ile doldurulan), ``pct_imputed_of_total``.
+        """
+        if not isinstance(raw, pd.DataFrame):
+            raise PreprocessingError("raw must be a pandas DataFrame.")
+        if raw.empty:
+            raise PreprocessingError("Cannot score quality on an empty DataFrame.")
+
+        n_rows, n_cols = raw.shape
+        total_cells = int(n_rows * n_cols)
+        if total_cells == 0:
+            raise PreprocessingError("DataFrame has no cells.")
+
+        missing_cells = int(raw.isna().sum().sum())
+        fill_ratio = (total_cells - missing_cells) / float(total_cells)
+        missing_ratio = missing_cells / float(total_cells)
+
+        imputed_cells = 0
+        if cleaned is not None:
+            if cleaned.shape != raw.shape:
+                raise PreprocessingError(
+                    "cleaned DataFrame must match raw shape for imputation counting."
+                )
+            imputed_cells = int((raw.isna() & cleaned.notna()).sum().sum())
+
+        return {
+            "total_cells": total_cells,
+            "missing_cells": missing_cells,
+            "fill_ratio": float(fill_ratio),
+            "missing_ratio": float(missing_ratio),
+            "pct_missing": float(100.0 * missing_ratio),
+            "pct_filled": float(100.0 * fill_ratio),
+            "imputed_cells": imputed_cells,
+            "pct_imputed_of_total": float(
+                100.0 * imputed_cells / float(total_cells) if total_cells else 0.0
+            ),
+        }
