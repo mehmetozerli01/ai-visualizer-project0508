@@ -1,9 +1,13 @@
 """
-Plotly-based interactive charts for clustering, anomalies, and feature views.
+Plotly ile kümeleme, anomali, dağılım ve korelasyon görselleştirmesi.
 
-This module stays independent of Streamlit; callers choose ``theme`` to match
-the host application's light or dark UI. Correlation views use
-:class:`processor.DataLoader` so numeric columns match the ingestion layer.
+Streamlit’ten bağımsızdır; ``theme`` ile açık/koyu şablon seçilir. Korelasyon
+ısı haritasında sayısal sütunlar :class:`processor.DataLoader` ile uyumlu tutulur.
+
+**Görselleştirme notu:** PCA düzlemi üzerindeki saçılım, yüksek boyutlu öklidyen
+yapının *doğrusal iki boyutlu* projeksiyonudur; bilgi kaybı PCA açıklanan
+varyans oranı ile raporlanmalıdır. Küme renkleri tüm ilgili grafiklerde sabittir
+(0=mavi, 1=turuncu, 2=yeşil, …).
 """
 
 from __future__ import annotations
@@ -18,16 +22,60 @@ from plotly.graph_objects import Figure
 
 from processor import DataLoader
 
+# Küme indeksine göre sabit renkler (0=mavi, 1=turuncu, 2=yeşil); tüm küme grafiklerinde ortak.
+_CLUSTER_COLORS_BY_INDEX: tuple[str, ...] = (
+    "#2563EB",
+    "#EA580C",
+    "#16A34A",
+    "#7C3AED",
+    "#DB2777",
+    "#0891B2",
+    "#CA8A04",
+    "#4F46E5",
+)
+
+
+def _cluster_id_str(v: Any) -> str:
+    """Küme etiketini Plotly ``color_discrete_map`` anahtarı için normalize eder."""
+    try:
+        if pd.isna(v):
+            return "?"
+        return str(int(v))
+    except (ValueError, TypeError):
+        return str(v)
+
+
+def cluster_color_discrete_map(labels: np.ndarray | pd.Series) -> dict[str, str]:
+    """Görünen her küme kimliği için sabit hex renk (indeks mod uzunluk)."""
+    lab = np.asarray(labels).ravel()
+    uniq = sorted({_cluster_id_str(x) for x in lab}, key=lambda s: int(s) if s.lstrip("-").isdigit() else 10**9)
+    out: dict[str, str] = {}
+    for s in uniq:
+        try:
+            k = int(s)
+        except ValueError:
+            k = 0
+        out[s] = _CLUSTER_COLORS_BY_INDEX[k % len(_CLUSTER_COLORS_BY_INDEX)]
+    return out
+
+
+# Random Forest önem çubukları: küme paletiyle uyumlu tek renk (Küme 0 mavisi).
+_FEATURE_IMPORTANCE_BAR_COLOR: str = _CLUSTER_COLORS_BY_INDEX[0]
+
 
 class DataVisualizer:
-    """Build consistent Plotly figures with shared layout and theming.
+    """Tutarlı başlık, eksen ve tema ile Plotly ``Figure`` üretir.
+
+    **Rol:** Model çıktılarını (etiketler, PCA koordinatları, korelasyon matrisi)
+    jüriye uygun, etkileşimli grafiklere çevirir; matematiksel tanım modülde değil,
+    ``ai_engine`` içindedir.
 
     Args:
-        theme: ``"light"`` uses the ``plotly_white`` template; ``"dark"`` uses
-            ``plotly_dark`` for axes, grid, and background harmony with dark UIs.
+        theme: ``"light"`` → ``plotly_white``; ``"dark"`` → ``plotly_dark``.
     """
 
     def __init__(self, theme: Literal["light", "dark"] = "light") -> None:
+        """Şablon ve font ailesini tema bayrağına göre sabitler."""
         self._theme: Literal["light", "dark"] = theme
         self._template: str = "plotly_dark" if theme == "dark" else "plotly_white"
 
@@ -40,7 +88,7 @@ class DataVisualizer:
         height: int = 520,
         legend: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Return layout kwargs shared by all figures."""
+        """Tüm figürlerde ortak başlık, eksen, yükseklik ve yazı tipi düzenini üretir."""
         leg = {"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1}
         if legend:
             leg.update(legend)
@@ -58,7 +106,7 @@ class DataVisualizer:
 
     @staticmethod
     def _resolve_pc_columns(df_pca: pd.DataFrame) -> tuple[str, str]:
-        """Pick x/y PCA column names (PC1/PC2 preferred, else first two columns)."""
+        """İki boyutlu düzlem için x/y sütun adlarını çözer (``PC1``/``PC2`` öncelikli)."""
         if df_pca.shape[1] < 2:
             raise ValueError("df_pca must contain at least two coordinate columns.")
         cols = list(df_pca.columns)
@@ -66,24 +114,33 @@ class DataVisualizer:
             return "PC1", "PC2"
         return str(cols[0]), str(cols[1])
 
-    def plot_clustering(self, df_pca: pd.DataFrame, labels: np.ndarray | pd.Series) -> Figure:
-        """Scatter PCA coordinates colored by cluster with rich hover.
+    def plot_clustering(
+        self,
+        df_pca: pd.DataFrame,
+        labels: np.ndarray | pd.Series,
+        *,
+        title: str | None = None,
+        variance_explained_pct: float | None = None,
+    ) -> Figure:
+        """K-Means etiketlerini PCA düzleminde renk kodlu saçılım olarak gösterir.
 
-        Extra columns in ``df_pca`` (beyond the two PC axes) are included in the
-        hover tooltip as row-level detail. The ``labels`` array must align with
-        ``df_pca.index`` row order.
+        **Görselleştirdiği yapı:** İki ana bileşen ekseninde örnekler; renk küme
+        ayrımını temsil eder (öklidyen uzaklık K-Means ile ölçeklenmiş uzayda
+        minimize edilmiştir). Ek sütunlar hover ile satır detayı sağlar;
+        ``custom_data`` satır seçimi için indeks taşır.
 
         Args:
-            df_pca: At least two columns for 2D coordinates (ideally ``PC1``,
-                ``PC2``). Additional columns appear in hover.
-            labels: Integer (or string) cluster id per row, same length as
-                ``df_pca``.
+            df_pca: En az iki koordinat sütunu (tercihen ``PC1``, ``PC2``).
+            labels: Satır ile hizalı küme etiketleri.
+            title: Özel başlık; ``None`` ise ``variance_explained_pct`` veya varsayılan.
+            variance_explained_pct: İlk iki PC için açıklanan toplam varyans yüzdesi
+                (başlığa eklenir; ``title`` verilmişse yok sayılır).
 
         Returns:
-            A ``plotly.graph_objects.Figure`` ready for ``st.plotly_chart``.
+            ``plotly.graph_objects.Figure``.
 
         Raises:
-            ValueError: If shapes mismatch or PCA columns cannot be resolved.
+            ValueError: Uzunluk uyumsuzluğu veya eksen çözülememesi.
         """
         if not isinstance(df_pca, pd.DataFrame):
             raise ValueError("df_pca must be a pandas DataFrame.")
@@ -95,53 +152,149 @@ class DataVisualizer:
 
         pc_x, pc_y = self._resolve_pc_columns(df_pca)
         work = df_pca.copy()
-        work["_cluster"] = lab.astype(str)
+        work["_cluster"] = [_cluster_id_str(x) for x in lab]
+        work["_row_key"] = work.index.map(lambda i: str(i))
 
         hover_cols = [
             c
             for c in work.columns
-            if c not in (pc_x, pc_y, "_cluster")
+            if c not in (pc_x, pc_y, "_cluster", "_row_key")
         ]
         hover_data = ["_cluster"] + hover_cols if hover_cols else ["_cluster"]
 
+        cmap = cluster_color_discrete_map(lab)
         fig = px.scatter(
             work,
             x=pc_x,
             y=pc_y,
             color="_cluster",
-            color_discrete_sequence=px.colors.qualitative.Bold,
+            color_discrete_map=cmap,
+            category_orders={"_cluster": sorted(cmap.keys(), key=lambda s: int(s) if s.lstrip("-").isdigit() else 0)},
             labels={
                 pc_x: pc_x,
                 pc_y: pc_y,
                 "_cluster": "Küme",
             },
             hover_data=hover_data,
+            custom_data=["_row_key"],
         )
         fig.update_traces(marker=dict(size=10, opacity=0.85, line=dict(width=0.5, color="white")))
+        if title is None:
+            if variance_explained_pct is not None:
+                title = (
+                    "K-Means kümeleme (PCA) — PC1+PC2 açıklanan varyans: "
+                    f"%{float(variance_explained_pct):.1f}"
+                )
+            else:
+                title = "K-Means kümeleme (PCA düzlemi)"
         fig.update_layout(
             **self._base_layout(
-                "K-Means kümeleme (PCA düzlemi)",
+                title,
                 xaxis_title=pc_x,
                 yaxis_title=pc_y,
             )
         )
         return fig
 
-    def plot_anomalies(
-        self, df_pca: pd.DataFrame, anomaly_labels: np.ndarray | pd.Series
+    def plot_manual_cluster_scatter(
+        self,
+        df: pd.DataFrame,
+        x_col: str,
+        y_col: str,
+        labels: np.ndarray | pd.Series,
+        *,
+        title: str | None = None,
     ) -> Figure:
-        """Plot PCA plane: normal points in blue, anomalies (-1) larger and red.
+        """İki seçili özellik ekseninde gözlemleri K-Means küme rengiyle gösterir (keşif).
+
+        **Amaç:** PCA bileşenleri soyutken, doğrudan anlaşılır değişken çiftlerinde
+        (ör. gelir–yaş) segmentasyonu jüriye somutlaştırmak. Eksenler ``df`` içindeki
+        ölçektedir; küme etiketleri ayrı bir uzayda üretilmiş olabilir (ör. log
+        dönüşümü sonrası model).
 
         Args:
-            df_pca: Two-dimensional PCA coordinates (e.g. ``PC1``, ``PC2``).
-            anomaly_labels: Per-row labels; ``-1`` anomaly, ``1`` normal
-                (scikit-learn ``IsolationForest`` convention).
+            df: ``x_col`` ve ``y_col`` içeren tablo; indeks ``labels`` ile hizalı.
+            x_col, y_col: Sayısal eksen adları (farklı olmalı).
+            labels: Satır ile eşleşen küme etiketleri.
+            title: Özel başlık; ``None`` ise ``"{x} vs {y} ilişkisi"`` üretilir.
 
         Returns:
-            Interactive ``Figure`` with two traces (normal vs anomali).
+            ``Figure`` (Plotly Express scatter).
 
         Raises:
-            ValueError: If lengths mismatch or PCA columns cannot be resolved.
+            ValueError: Eksik sütun, aynı eksen veya uzunluk uyumsuzluğu.
+        """
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("df must be a pandas DataFrame.")
+        if x_col == y_col:
+            raise ValueError("x_col and y_col must be different.")
+        if x_col not in df.columns or y_col not in df.columns:
+            raise ValueError("x_col and y_col must exist in df.")
+        lab = np.asarray(labels).ravel()
+        if lab.shape[0] != len(df):
+            raise ValueError(
+                f"labels length ({lab.shape[0]}) must match df rows ({len(df)})."
+            )
+
+        work = df[[x_col, y_col]].apply(pd.to_numeric, errors="coerce").copy()
+        work["_cluster"] = [_cluster_id_str(x) for x in lab]
+        work["_row_key"] = df.index.map(lambda i: str(i))
+
+        cmap = cluster_color_discrete_map(lab)
+        fig = px.scatter(
+            work,
+            x=x_col,
+            y=y_col,
+            color="_cluster",
+            color_discrete_map=cmap,
+            category_orders={"_cluster": sorted(cmap.keys(), key=lambda s: int(s) if s.lstrip("-").isdigit() else 0)},
+            labels={
+                x_col: str(x_col),
+                y_col: str(y_col),
+                "_cluster": "Küme",
+            },
+            hover_data=["_cluster"],
+            custom_data=["_row_key"],
+        )
+        fig.update_traces(
+            marker=dict(size=10, opacity=0.85, line=dict(width=0.5, color="white"))
+        )
+        if title is None:
+            title = f"{x_col} vs {y_col} ilişkisi (K-Means renkleri)"
+        fig.update_layout(
+            **self._base_layout(
+                title,
+                xaxis_title=str(x_col),
+                yaxis_title=str(y_col),
+            )
+        )
+        return fig
+
+    def plot_anomalies(
+        self,
+        df_pca: pd.DataFrame,
+        anomaly_labels: np.ndarray | pd.Series,
+        *,
+        title: str | None = None,
+        variance_explained_pct: float | None = None,
+    ) -> Figure:
+        """Isolation Forest çıktısını PCA düzleminde normal (1) / anomali (-1) olarak çizer.
+
+        **Okuma:** ``-1`` aykırı, ``1`` normal (scikit-learn sözleşmesi); kırmızı
+        büyük işaretçiler modelin düşük yoğunluk / kısa yol skoruna dayalı kararını
+        vurgular (nedensel açıklama değildir).
+
+        Args:
+            df_pca: İki boyutlu PCA koordinatları.
+            anomaly_labels: Satır bazlı tahmin etiketleri.
+            title: Özel başlık; ``None`` ise varyans veya varsayılan metin.
+            variance_explained_pct: PCA düzleminde açıklanan varyans yüzdesi (başlıkta).
+
+        Returns:
+            İki izli (normal / anomali) ``Figure``.
+
+        Raises:
+            ValueError: Uzunluk veya eksen çözümü hatası.
         """
         if not isinstance(df_pca, pd.DataFrame):
             raise ValueError("df_pca must be a pandas DataFrame.")
@@ -157,8 +310,9 @@ class DataVisualizer:
         is_anomaly = preds == -1
         normal = ~is_anomaly
 
-        # Hover: index + coords + label
+        # Hover: index + coords + label; customdata = ham satır anahtarı (seçim eşlemesi)
         idx = df_pca.index.astype(str)
+        idx_raw = df_pca.index.to_numpy()
 
         fig = go.Figure()
         fig.add_trace(
@@ -174,7 +328,8 @@ class DataVisualizer:
                     line=dict(width=0.5, color="rgba(255,255,255,0.35)"),
                 ),
                 text=[f"idx={i}<br>{pc_x}={xv:.4f}<br>{pc_y}={yv:.4f}<br>label=1" for i, xv, yv in zip(idx[normal], x[normal], y[normal])],
-                hoverinfo="text",
+                customdata=np.asarray(idx_raw[normal], dtype=object).reshape(-1, 1),
+                hovertemplate="%{text}<extra></extra>",
             )
         )
         fig.add_trace(
@@ -191,27 +346,43 @@ class DataVisualizer:
                     line=dict(width=2, color="#FFFFFF"),
                 ),
                 text=[f"idx={i}<br>{pc_x}={xv:.4f}<br>{pc_y}={yv:.4f}<br>label=-1" for i, xv, yv in zip(idx[is_anomaly], x[is_anomaly], y[is_anomaly])],
-                hoverinfo="text",
+                customdata=np.asarray(idx_raw[is_anomaly], dtype=object).reshape(-1, 1),
+                hovertemplate="%{text}<extra></extra>",
             )
         )
-        fig.update_layout(**self._base_layout("Anomali tespiti (PCA düzlemi)", pc_x, pc_y))
+        if title is None:
+            if variance_explained_pct is not None:
+                title = (
+                    "Anomali tespiti (PCA) — PC1+PC2 açıklanan varyans: "
+                    f"%{float(variance_explained_pct):.1f}"
+                )
+            else:
+                title = "Anomali tespiti (PCA düzlemi)"
+        fig.update_layout(**self._base_layout(title, pc_x, pc_y))
         return fig
 
-    def plot_feature_distribution(self, df: pd.DataFrame, column: str) -> Figure:
-        """Show distribution of a single column (histogram or bar).
+    def plot_feature_distribution(
+        self,
+        df: pd.DataFrame,
+        column: str,
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """Tek değişkenin dağılımını histogram (sayısal) veya çubuk (kategorik) ile gösterir.
 
-        Numeric columns use a histogram; non-numeric columns use a bar chart of
-        category frequencies.
+        **Amaç:** Özellik uzayındaki marjinal dağılımı keşifsel olarak incelemek;
+        küme veya anomali modeli ile doğrudan aynı optimizasyonu çözmez.
 
         Args:
-            df: Source table.
-            column: Column name present in ``df``.
+            df: Kaynak tablo.
+            column: Var olan sütun adı.
+            title: Özel başlık; ``None`` ise sütun adından türetilir.
 
         Returns:
-            ``Figure`` with titled axes and theme-aware styling.
+            Temalı ``Figure``.
 
         Raises:
-            ValueError: If ``column`` is missing from ``df``.
+            ValueError: Sütun yoksa.
         """
         if column not in df.columns:
             raise ValueError(f"Column {column!r} not found in DataFrame.")
@@ -225,9 +396,10 @@ class DataVisualizer:
                 color_discrete_sequence=["#6366F1"],
             )
             fig.update_traces(marker=dict(line=dict(width=0.5, color="white")))
+            dist_title = title if title is not None else f"Dağılım: {column}"
             fig.update_layout(
                 **self._base_layout(
-                    f"Dağılım: {column}",
+                    dist_title,
                     xaxis_title=str(column),
                     yaxis_title="Frekans",
                 )
@@ -248,9 +420,10 @@ class DataVisualizer:
                 y="count",
                 color_discrete_sequence=["#0EA5E9"],
             )
+            cat_title = title if title is not None else f"Kategori frekansı: {column}"
             fig.update_layout(
                 **self._base_layout(
-                    f"Kategori frekansı: {column}",
+                    cat_title,
                     xaxis_title=str(column),
                     yaxis_title="Adet",
                 )
@@ -264,20 +437,25 @@ class DataVisualizer:
         elbow_df: pd.DataFrame,
         *,
         selected_k: int | None = None,
+        title: str | None = None,
     ) -> Figure:
-        """Line chart of K-Means inertia vs k (elbow method).
+        """Dirsek yöntemi: *k* ile K-Means inertia (WCSS) eğrisini çizer.
+
+        **Yorum:** Eğride belirgin dirsek, küme sayısı artışına karşı marjinal
+        WCSS düşüşünün yavaşladığı bölgeyi işaret etmeye yardım eder (sezgisel
+        seçim; istatistiksel test değildir). ``selected_k`` dikey çizgi ile UI
+        seçimiyle hizalanır.
 
         Args:
-            elbow_df: Data frame with columns ``k`` and ``inertia`` (e.g. from
-                :meth:`ai_engine.AIEngine.elbow_inertia_scan`).
-            selected_k: When set, draws a vertical dashed line at this cluster
-                count to relate the plot to the user's K-Means setting.
+            elbow_df: ``k`` ve ``inertia`` sütunları (:meth:`ai_engine.AIEngine.elbow_inertia_scan`).
+            selected_k: İşaretlenecek kullanıcı *k* değeri.
+            title: Özel grafik başlığı.
 
         Returns:
-            Themed Plotly figure.
+            Temalı ``Figure``.
 
         Raises:
-            ValueError: If required columns are missing or the frame is empty.
+            ValueError: Eksik sütun veya boş çerçeve.
         """
         if not isinstance(elbow_df, pd.DataFrame) or elbow_df.empty:
             raise ValueError("elbow_df must be a non-empty DataFrame.")
@@ -292,9 +470,14 @@ class DataVisualizer:
             color_discrete_sequence=["#7C3AED"],
         )
         fig.update_traces(line=dict(width=2), marker=dict(size=8))
+        elbow_title = (
+            title
+            if title is not None
+            else "Dirsek yöntemi: K vs inertia (WCSS, ölçeklenmiş uzayda)"
+        )
         fig.update_layout(
             **self._base_layout(
-                "Dirsek yöntemi: K vs inertia (WCSS, ölçeklenmiş uzayda)",
+                elbow_title,
                 xaxis_title="k (küme sayısı)",
                 yaxis_title="Inertia (küme içi kare uzaklık toplamı)",
             )
@@ -314,22 +497,27 @@ class DataVisualizer:
         self,
         df: pd.DataFrame,
         numeric_columns: list[str] | None = None,
+        *,
+        title: str | None = None,
     ) -> Figure:
-        """Pearson correlation heatmap for numeric columns.
+        """Sayısal sütunlar için Pearson korelasyon matrisinin ısı haritası.
+
+        **Matematiksel nesne:** Çiftler arası doğrusal ilişki katsayısı
+        :math:`r \\in [-1,1]`; ölçekten bağımsız kıyas için değişkenler analiz
+        öncesi tipik olarak standartlaştırılmış olmalıdır (bu grafik ham sütun
+        üzerinden korelasyonu hesaplar — model uzayı ile uyum için yalnızca
+        çıkarılmış sayısal sütunlar kullanılır).
 
         Args:
-            df: Source table.
-            numeric_columns: Columns to include; if ``None``, all columns that
-                :meth:`processor.DataLoader.infer_column_types` marks as numeric
-                are used. Non-numeric names are dropped so the heatmap uses only
-                model-aligned numeric features.
+            df: Kaynak tablo.
+            numeric_columns: Alt küme; ``None`` ise ``DataLoader`` sayısal listesi.
+            title: Özel grafik başlığı.
 
         Returns:
-            ``Figure`` with diverging colors around zero correlation.
+            ``RdBu_r`` ile ``zmin=-1``, ``zmax=1`` sınırlı ``Figure``.
 
         Raises:
-            ValueError: If fewer than two numeric columns are available after
-                selection.
+            ValueError: İki sayısal sütundan az kaldıysa.
         """
         if not isinstance(df, pd.DataFrame):
             raise ValueError("df must be a pandas DataFrame.")
@@ -369,13 +557,143 @@ class DataVisualizer:
             textfont={"size": 11},
             hovertemplate="x=%{x}<br>y=%{y}<br>r=%{z:.2f}<extra></extra>",
         )
+        hm_title = title if title is not None else "Korelasyon matrisi (Pearson)"
         fig.update_layout(
             **self._base_layout(
-                "Korelasyon matrisi (Pearson)",
+                hm_title,
                 xaxis_title="",
                 yaxis_title="",
                 height=560,
             )
         )
         fig.update_xaxes(side="bottom")
+        return fig
+
+    def plot_cluster_feature_importance(
+        self,
+        importance_df: pd.DataFrame,
+        *,
+        title: str | None = None,
+        chart_height: int | None = None,
+    ) -> Figure:
+        """Küme ayrımında Random Forest ``feature_importances_`` yatay çubuk grafiği.
+
+        Args:
+            importance_df: En az iki sütun; birinci özellik adı, ikinci önem skoru.
+            title: Grafik başlığı.
+            chart_height: Piksel yüksekliği (``None`` → varsayılan).
+
+        Returns:
+            Yatay ``bar`` ``Figure``.
+
+        Raises:
+            ValueError: Boş veya eksik sütun.
+        """
+        if not isinstance(importance_df, pd.DataFrame) or importance_df.empty:
+            raise ValueError("importance_df must be a non-empty DataFrame.")
+        if importance_df.shape[1] < 2:
+            raise ValueError("importance_df needs at least two columns.")
+        feat_col = str(importance_df.columns[0])
+        imp_col = str(importance_df.columns[1])
+        plot_df = importance_df.sort_values(imp_col, ascending=True)
+        fig = px.bar(
+            plot_df,
+            x=imp_col,
+            y=feat_col,
+            orientation="h",
+            color_discrete_sequence=[_FEATURE_IMPORTANCE_BAR_COLOR],
+        )
+        fig.update_traces(marker=dict(line=dict(width=0.5, color="white")))
+        h = int(chart_height) if chart_height is not None else 520
+        bar_title = (
+            title
+            if title is not None
+            else "Kümeleri en çok ayıran faktörler (Random Forest önemi)"
+        )
+        fig.update_layout(
+            **self._base_layout(
+                bar_title,
+                xaxis_title="Önem (normalize, toplam = 1)",
+                yaxis_title="Özellik",
+                height=h,
+            )
+        )
+        fig.update_layout(showlegend=False)
+        return fig
+
+    def plot_cluster_boxplots(
+        self,
+        df: pd.DataFrame,
+        column: str,
+        labels: np.ndarray | pd.Series,
+        *,
+        title: str | None = None,
+        chart_height: int | None = None,
+    ) -> Figure:
+        """Tek sayısal sütunun küme etiketine göre kutu grafikleri (yan yana).
+
+        Medyan ve çeyrekler arası aralık, küme içi yayılımı PCA’dan bağımsız
+        olarak gösterir; ayrık kümelerde kutu konumları farklılaşır.
+
+        Args:
+            df: Kaynak tablo.
+            column: Sayısal sütun adı.
+            labels: Satır ile hizalı küme etiketleri.
+            title: Başlık.
+            chart_height: Piksel yüksekliği.
+
+        Returns:
+            ``px.box`` ``Figure``.
+
+        Raises:
+            ValueError: Sütun yok, sayısal veri yok veya boş sonuç.
+        """
+        if column not in df.columns:
+            raise ValueError(f"Column {column!r} not found in DataFrame.")
+        lab = np.asarray(labels).ravel()
+        if lab.shape[0] != len(df):
+            raise ValueError("labels length must match df rows.")
+
+        yvals = pd.to_numeric(df[column], errors="coerce")
+        work = pd.DataFrame(
+            {
+                str(column): yvals,
+                "Küme": pd.Series(lab, index=df.index).astype(int).astype(
+                    "string"
+                ),
+            },
+            index=df.index,
+        ).dropna(subset=[str(column)])
+        if work.empty:
+            raise ValueError("No valid numeric values for box plot.")
+
+        cat_order = sorted(work["Küme"].unique(), key=lambda x: int(x))
+        work["Küme"] = pd.Categorical(
+            work["Küme"], categories=cat_order, ordered=True
+        )
+
+        cmap = cluster_color_discrete_map(lab)
+        fig = px.box(
+            work,
+            x="Küme",
+            y=str(column),
+            color="Küme",
+            color_discrete_map=cmap,
+            category_orders={"Küme": cat_order},
+        )
+        h = int(chart_height) if chart_height is not None else 480
+        box_title = (
+            title
+            if title is not None
+            else f"{column} — küme bazında dağılım (kutu grafik)"
+        )
+        fig.update_layout(
+            **self._base_layout(
+                box_title,
+                xaxis_title="Küme",
+                yaxis_title=str(column),
+                height=h,
+            )
+        )
+        fig.update_layout(legend_title_text="Küme")
         return fig

@@ -1,8 +1,10 @@
 """
-Structured data loading, column inference, summarization, and cleaning.
+Yapılandırılmış veri yükleme, şema çıkarımı, özet ve eksik değer temizliği.
 
-This module exposes :class:`DataLoader` for CSV/Excel ingestion and preprocessing
-steps used before machine learning in the visualization app.
+:class:`DataLoader` CSV/Excel okuma ve ML öncesi ön işlemi kapsar. İmputation
+kuralları istatistiksel (ortalama, mod, medyan) ve semantiktir; **eksik verinin
+tamamen kayıpsız giderilmesi mümkün değildir** — amaç tutarlı ve analiz edilebilir
+bir tablo üretmektir.
 """
 
 from __future__ import annotations
@@ -23,34 +25,36 @@ _NUMERIC_STRING_RATIO: float = 0.95
 
 class DataLoader:
     """
-    Load tabular files and prepare pandas DataFrames for downstream analysis.
+    Tabular dosyaları okur ve pandas ``DataFrame`` olarak ML boru hattına hazırlar.
 
-    Responsibilities include format detection, parsing, schema inference
-    (numeric vs categorical columns), descriptive summaries, and missing-value
-    imputation tailored by column type.
+    **Rol:** Biçim algılama, ayrıştırma, sayısal/kategorik şema çıkarımı, tanımlayıcı
+    özetler ve sütun tipine göre eksik değer doldurma (imputation). Çıkarım
+    kuralları, sayısal benzeri metin sütunlarını oran eşiği ile ayırt eder.
     """
 
     @staticmethod
     def load_file(file_obj: BinaryIO) -> pd.DataFrame:
         """
-        Read a CSV or Excel workbook from a binary file-like object.
+        İkili akıştan CSV veya Excel çalışma kitabını okur (ayrıştırma problemi).
+
+        **Girdi:** ``read()`` destekleyen dosya benzeri nesne; uzantı ``name``
+        üzerinden seçilir. **Çıktı:** Ham tablo; şema çıkarımı :meth:`infer_column_types`
+        ile ayrı yapılır.
 
         Parameters
         ----------
         file_obj
-            Readable binary stream (e.g. Streamlit ``UploadedFile``). Must expose
-            ``read()`` and the caller should provide ``name`` on the object when
-            available for extension detection.
+            Örn. Streamlit ``UploadedFile``; ``name`` ile ``.csv`` / ``.xlsx`` seçimi.
 
         Returns
         -------
         pd.DataFrame
-            Parsed tabular data with original column names preserved.
+            Orijinal sütun adları korunmuş tablo.
 
         Raises
         ------
         DataLoadError
-            If the format is unsupported, the file is empty, or parsing fails.
+            Desteklenmeyen biçim, boş dosya veya ayrıştırma hatası.
         """
         try:
             raw = file_obj.read()
@@ -92,21 +96,21 @@ class DataLoader:
     @staticmethod
     def infer_column_types(df: pd.DataFrame) -> tuple[list[str], list[str]]:
         """
-        Split columns into numeric and categorical groups for preprocessing.
+        Sütunları ön işlem kuralları için sayısal ve kategorik kümeye ayırır.
 
-        Boolean and datetime columns are treated as categorical for imputation
-        rules (see :meth:`clean_data`). Object columns that are mostly numeric
-        strings are classified as numeric after coercion.
+        **Heuristik problemi:** Metin/object sütunlarında ``to_numeric`` başarı
+        oranı eşik (:data:`_NUMERIC_STRING_RATIO`) üzerindeyse sayısal kabul edilir;
+        bool ve datetime kategorik imputation kuralına alınır (:meth:`clean_data`).
 
         Parameters
         ----------
         df
-            Input frame.
+            Girdi çerçevesi.
 
         Returns
         -------
         tuple[list[str], list[str]]
-            ``(numeric_columns, categorical_columns)`` with no duplicate names.
+            ``(numeric_columns, categorical_columns)``, tekrarsız isimler.
         """
         if df.empty:
             return [], []
@@ -126,7 +130,12 @@ class DataLoader:
 
     @staticmethod
     def _is_numeric_feature_column(series: pd.Series) -> bool:
-        """Return True if the series should be imputed and scaled as numeric."""
+        """
+        Serinin sayısal özellik olarak ölçeklenip doldurulup doldurulmayacağını döner.
+
+        **Kriter:** Yerleşik sayısal dtype, veya metin sütununda yüksek oranda
+        başarılı sayısal zorlama (eşik tabanlı ikili sınıflandırma).
+        """
         if pd.api.types.is_bool_dtype(series):
             return False
         if pd.api.types.is_datetime64_any_dtype(series):
@@ -148,28 +157,28 @@ class DataLoader:
     @staticmethod
     def get_summary_stats(df: pd.DataFrame) -> dict[str, Any]:
         """
-        Build a structured summary for UI or logging.
+        Tanımlayıcı istatistik ve şema özetini tek sözlükte toplar (EDA görünümü).
 
-        Includes shape, inferred numeric/categorical column lists, per-column
-        missing counts, ``describe`` output for numeric columns, and small
-        frequency tables for categorical columns.
+        **İçerik:** Boyut, çıkarılan sayısal/kategorik listeler, sütun başına eksik
+        sayımı, sayısal ``describe`` ve kategorik frekans üstleri — jüri / rapor
+        için yapılandırılmış özet.
 
         Parameters
         ----------
         df
-            Data to summarize.
+            Özetlenecek veri.
 
         Returns
         -------
         dict[str, Any]
-            Keys: ``row_count``, ``column_count``, ``columns``, ``numeric_columns``,
+            ``row_count``, ``column_count``, ``columns``, ``numeric_columns``,
             ``categorical_columns``, ``missing_per_column``, ``numeric_describe``,
             ``categorical_top_values``.
 
         Raises
         ------
         PreprocessingError
-            If ``df`` is empty or not a DataFrame.
+            Boş veya geçersiz ``DataFrame``.
         """
         if not isinstance(df, pd.DataFrame):
             raise PreprocessingError("Expected a pandas DataFrame.")
@@ -203,28 +212,28 @@ class DataLoader:
     @staticmethod
     def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         """
-        Return a copy of ``df`` with missing values filled by column type.
+        Eksik değerleri sütun tipine göre doldurarak kopya üretir (imputation).
 
-        Numeric columns (including object columns inferred as numeric) are filled
-        with the column mean; if all values are missing, fills with ``0.0``.
-        Categorical-like columns (object, string, category, bool, datetime) use
-        ``'Unknown'`` where a string placeholder is appropriate; datetimes use
-        the column median timestamp; booleans use the mode or ``False``.
+        **Matematiksel anlam:** Sayısal sütunlarda sütun ortalaması
+        :math:`\\hat{\\mu}_j` ile eksikleri doldurma (tamamı eksikse ``0.0``);
+        kategorikte moda / ``Unknown``; zamanda medyan zaman damgası — bu, ML
+        öncesi **basit tek değer imputation** stratejisidir (varyansı küçükte olsa
+        değiştirir).
 
         Parameters
         ----------
         df
-            Raw frame produced by :meth:`load_file` or compatible source.
+            :meth:`load_file` veya uyumlu kaynaktan ham çerçeve.
 
         Returns
         -------
         pd.DataFrame
-            Cleaned copy; original frame is not modified.
+            Temizlenmiş kopya; orijinal değişmez.
 
         Raises
         ------
         PreprocessingError
-            If ``df`` is empty or invalid.
+            Boş veya geçersiz çerçeve.
         """
         if not isinstance(df, pd.DataFrame):
             raise PreprocessingError("Expected a pandas DataFrame.")
@@ -260,32 +269,89 @@ class DataLoader:
         return out
 
     @staticmethod
+    def apply_log1p_to_numeric_columns(
+        df: pd.DataFrame,
+        columns: list[str] | None = None,
+    ) -> tuple[pd.DataFrame, list[str]]:
+        """
+        Seçili sayısal sütunlarda ``log1p`` ile varyans dengeleme (sağ çarpık dağılımlar).
+
+        **Matematiksel işlem:** :math:`x \\mapsto \\log(1 + \\max(x, 0))` (``numpy.log1p``),
+        yalnızca sütunun tüm gözlemlenebilir değerleri :math:`\\geq 0` ise uygulanır;
+        aksi halde sütun olduğu gibi bırakılır ve isim ``skipped`` listesine eklenir
+        (negatif veya karışık işaretli sütunlarda log tanımı sorunludur).
+
+        Parameters
+        ----------
+        df
+            Kaynak çerçeve (kopyalanır).
+        columns
+            Dönüştürülecek sütunlar; ``None`` ise :meth:`infer_column_types` ile
+            sayısal sütunların tümü denenir.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, list[str]]
+            Dönüştürülmüş kopya ve atlanan sütun adları.
+
+        Raises
+        ------
+        PreprocessingError
+            Boş çerçeve.
+        """
+        if not isinstance(df, pd.DataFrame):
+            raise PreprocessingError("Expected a pandas DataFrame.")
+        if df.empty:
+            raise PreprocessingError("Cannot transform an empty DataFrame.")
+
+        inferred_numeric, _ = DataLoader.infer_column_types(df)
+        inferred_set = set(inferred_numeric)
+        if columns is None:
+            use_cols = [c for c in inferred_numeric if c in df.columns]
+        else:
+            use_cols = [c for c in columns if c in df.columns and c in inferred_set]
+
+        out = df.copy()
+        skipped: list[str] = []
+
+        for col in use_cols:
+            s = pd.to_numeric(out[col], errors="coerce")
+            finite = s.dropna()
+            if finite.empty:
+                skipped.append(col)
+                continue
+            if float(finite.min()) < 0.0:
+                skipped.append(col)
+                continue
+            out[col] = np.log1p(s.clip(lower=0.0))
+
+        return out, skipped
+
+    @staticmethod
     def compute_fill_quality_metrics(
         raw: pd.DataFrame,
         cleaned: pd.DataFrame | None = None,
     ) -> dict[str, float | int]:
         """
-        Measure overall missingness and how many cells were filled by cleaning.
+        Ham veri doluluk oranı ve temizlikle kapatılan hücre sayısını ölçer.
 
-        Doluluk oranı: payda tüm hücre sayısı (satır × sütun). Eksik hücreler
-        ham verideki NaN sayımıdır. ``cleaned`` verildiğinde, hamda eksik olup
-        temizlenmiş tabloda dolu olan hücre sayısı otomatik doldurma (ortalama,
-        mod, ``Unknown`` vb.) ile kapatılmış kabul edilir.
+        **Tanımlar:** Payda :math:`n \\times p` toplam hücre; eksiklik ham ``NaN``
+        sayısıdır. ``cleaned`` ile birlikte, hamda ``NaN`` iken temizde dolu olan
+        hücreler *imputation ile doldurulmuş* sayılır (kalite göstergesi, gerçek
+        değer bilgisi değildir).
 
         Parameters
         ----------
         raw
-            Ham yükleme çıktısı.
+            Ham tablo.
         cleaned
-            :meth:`clean_data` çıktısı; ``None`` ise sadece ham eksiklik raporu
-            üretilir.
+            :meth:`clean_data` çıktısı veya ``None`` (yalnızca ham özet).
 
         Returns
         -------
         dict[str, float | int]
-            ``total_cells``, ``missing_cells``, ``fill_ratio`` (0–1),
-            ``missing_ratio`` (0–1), ``pct_missing``, ``pct_filled`` (doluluk %),
-            ``imputed_cells`` (temizleme ile doldurulan), ``pct_imputed_of_total``.
+            ``total_cells``, ``missing_cells``, ``fill_ratio``, ``missing_ratio``,
+            ``pct_missing``, ``pct_filled``, ``imputed_cells``, ``pct_imputed_of_total``.
         """
         if not isinstance(raw, pd.DataFrame):
             raise PreprocessingError("raw must be a pandas DataFrame.")

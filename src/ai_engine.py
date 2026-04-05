@@ -1,9 +1,23 @@
 """
-Machine learning analysis core: scaling, clustering, PCA, and anomaly detection.
+Makine öğrenmesi çekirdeği: ölçekleme, kümeleme, boyut indirgeme ve anomali tespiti.
 
-This module is intentionally free of Streamlit or plotting dependencies.
-Numeric column selection aligns with :class:`processor.DataLoader` inference
-so the same features drive statistics, cleaning, and modeling.
+Bu modül Streamlit veya çizim kütüphanelerine bağlı değildir. Sayısal sütun seçimi
+:class:`processor.DataLoader` ile uyumludur; böylece özet istatistik, temizleme ve
+modelleme aynı özellik uzayını paylaşır.
+
+Matematiksel özeti
+-------------------
+* **StandardScaler** — Özellikleri sıfır ortalama ve birim varyansa getirir (z-skoru);
+  öklidyen uzaklığın ölçeğe duyarlılığını giderir.
+* **K-Means** — Öklidyen uzaklıkta küme içi kare hatalar toplamını (inertia / WCSS)
+  yerel olarak minimize eden ayrım problemidir.
+* **PCA** — Kovaryans yapısına dayalı doğrusal projeksiyon; varyansın üst üste
+  binmeyen doğrusal bileşenlere ayrıştırılması (SVD tabanlı çözüm).
+* **Isolation Forest** — Rastgele ayrımlarla aykırıların daha kısa yoldan izole
+  edildiği ansamble yöntem; ``contamination`` ön bilgisine bağlıdır.
+* **Random Forest (küme önemi)** — K-Means etiketleri sınıf kabul edilerek
+  ölçeklenmiş özelliklerde ayırma önemleri (``feature_importances_``); keşifsel
+  yorum içindir, nedensel kanıt değildir.
 """
 
 from __future__ import annotations
@@ -14,7 +28,7 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
@@ -23,22 +37,22 @@ from processor import DataLoader
 
 
 class AIEngine:
-    """Run distance-based ML models on tabular data with consistent preprocessing.
+    """Tabular veride öklidyen-uzaklık tabanlı modelleri tek tip ön işlemle çalıştırır.
 
-    Public methods expect a non-empty ``pandas.DataFrame`` and scale numeric
-    features with ``StandardScaler`` before fitting, which stabilizes K-Means,
-    PCA, and Isolation Forest in feature space.
+    Tüm fit işlemleri önce **StandardScaler** ile aynı ölçeklenmiş uzayda yapılır;
+    bu, K-Means (WCSS minimizasyonu), PCA (varyans yönleri) ve Isolation Forest
+    (rastgele altuzay ayrımları) için numerik kararlılık sağlar.
 
     Attributes:
-        _random_state: Integer seed passed to stochastic estimators.
+        _random_state: Stokastik tahminleyicilere iletilen tekrarlanabilirlik tohumu.
     """
 
     def __init__(self, random_state: int = 42) -> None:
-        """Create an engine with a reproducible RNG seed for all estimators.
+        """Tahminleyiciler için ortak RNG tohumunu ayarlar.
 
         Args:
-            random_state: Integer seed used by K-Means, PCA, and Isolation
-                Forest.
+            random_state: K-Means, PCA ve Isolation Forest için sabit tohum
+                (aynı veri-tekrar üretilebilir sonuç).
         """
         self._random_state: Final[int] = random_state
 
@@ -47,20 +61,21 @@ class AIEngine:
         df: pd.DataFrame,
         numeric_columns: list[str] | None = None,
     ) -> tuple[np.ndarray, list[str]]:
-        """Select numeric columns, coerce values, impute missing values, and scale.
+        """Sayısal matris hazırlar: seçim, zorunlu sayısallaştırma, eksik doldurma, z-skoru.
 
-        Uses ``DataLoader.infer_column_types`` so numeric detection matches the
-        ingestion layer (including numeric-like strings). When
-        ``numeric_columns`` is set, only those names are used (must be a subset
-        of inferred numeric columns).
+        **Matematiksel rol:** :math:`X \\in \\mathbb{R}^{n \\times d}` üzerinde sütun
+        bazlı ortalama ile eksik imputation, ardından
+        :math:`z_{ij} = (x_{ij} - \\mu_j) / \\sigma_j` (``StandardScaler``).
+        Böylece sonraki adımlarda öklidyen uzaklık anlamlı hale gelir.
+
+        ``DataLoader.infer_column_types`` ile yükleme katmanıyla aynı sayısal sütun
+        tanımı kullanılır. ``numeric_columns`` verilirse yalnızca bu alt küme.
 
         Returns:
-            A tuple ``(X_scaled, numeric_column_names)`` where ``X_scaled`` is a
-            ``float64`` array of shape ``(n_samples, n_numeric_features)``.
+            ``(X_scaled, use_cols)`` — ölçeklenmiş ``float64`` matris ve sütun adları.
 
         Raises:
-            AIModelError: If the frame is empty, has no usable numeric columns,
-                or scaling fails.
+            AIModelError: Boş çerçeve, sayısal sütun yokluğu veya ölçekleme hatası.
         """
         if not isinstance(df, pd.DataFrame):
             raise AIModelError("Input must be a pandas DataFrame.")
@@ -122,28 +137,32 @@ class AIEngine:
         k_max: int = 10,
         numeric_columns: list[str] | None = None,
     ) -> pd.DataFrame:
-        """Compute K-Means inertia (within-cluster sum of squares) for k = 1 … k_max.
+        """Dirsek yöntemi için her *k* değerinde K-Means **inertia** (WCSS) tarar.
 
-        Used for the elbow method: plot ``k`` vs ``inertia`` and look for an
-        "elbow" where marginal gains shrink.
+        **Matematiksel problem:** Her sabit *k* için K-Means, ölçeklenmiş uzayda
+        :math:`\\sum_{i} \\min_{c} \\|x_i - \\mu_c\\|^2` (küme içi kare uzaklık
+        toplamı) üzerinde yerel minimum arar; burada raporlanan ``inertia`` bu
+        değerdir. *k* arttıkça WCSS genelde azalır; dirsek, marjinal kazancın
+        kırıldığı bölgeyi seçmeye yardım eder.
 
         Args:
-            df: Input table.
-            k_max: Largest k to try; capped by row count and feature count.
-            numeric_columns: Optional subset of inferred numeric columns.
+            df: Girdi tablosu.
+            k_max: Denenecek üst *k* (satır sayısına kısıtlanır).
+            numeric_columns: İsteğe bağlı sayısal sütun alt kümesi.
 
         Returns:
-            DataFrame with columns ``k`` and ``inertia`` (float).
+            ``k`` ve ``inertia`` sütunlu ``DataFrame``.
 
         Raises:
-            AIModelError: If preparation fails or no valid k range.
+            AIModelError: Hazırlık veya geçerli *k* aralığı yoksa.
         """
         if k_max < 1:
             raise AIModelError("k_max must be at least 1.")
 
         X, _ = self._prepare_data(df, numeric_columns=numeric_columns)
         n_samples = int(X.shape[0])
-        upper = min(k_max, n_samples)
+        # k = n_samples anlamsız kümeleme ve Silhouette ile uyumsuz; tarama üst sınırı n-1.
+        upper = min(int(k_max), max(1, n_samples - 1))
         if upper < 1:
             raise AIModelError("Not enough rows for elbow scan.")
 
@@ -165,23 +184,28 @@ class AIEngine:
         n_clusters: int = 3,
         numeric_columns: list[str] | None = None,
     ) -> tuple[np.ndarray, float, float | None]:
-        """Partition rows into ``n_clusters`` groups using K-Means on scaled data.
+        """Ölçeklenmiş uzayda **K-Means** ile ayrım; inertia ve isteğe bağlı Silhouette.
+
+        **Matematiksel problem:** *k* sabit küme merkezi :math:`\\{\\mu_c\\}_{c=1}^k`
+        ile örnekleri en yakın merkeze atayarak öklidyen WCSS’i minimize etmeye
+        çalışır (NP-zor global optimum; Lloyd tipi yinelemeli yaklaşım).
+
+        **Silhouette:** Aynı ölçeklenmiş uzayda, gözlemlerin kendi kümesine göre
+        komşu kümeye göre ne kadar daha iyi oturduğunun ortalaması
+        (:math:`s \\in [-1,1]`); yüksek değer daha ayrık kümeleri destekler.
 
         Args:
-            df: Input table; inferred numeric columns are used, or ``numeric_columns``
-                if provided.
-            n_clusters: Number of clusters (>= 1 and at most the row count).
-            numeric_columns: Optional subset of inferred numeric column names.
+            df: Girdi tablosu.
+            n_clusters: Küme sayısı (1 … satır sayısı).
+            numeric_columns: İsteğe bağlı sayısal sütun listesi.
 
         Returns:
-            ``(labels, inertia, silhouette)`` where ``labels`` has shape ``(n_samples,)``
-            aligned with ``df.index``, ``inertia`` is the K-Means WCSS on the **scaled**
-            matrix, and ``silhouette`` is the mean Silhouette score (Euclidean on the
-            same scaled data) when ``k >= 2`` and labels split into at least two
-            clusters; otherwise ``None``.
+            ``(labels, inertia, silhouette)`` — etiketler, WCSS, ve *k* ≥ 2 ile en az
+            iki farklı küme varsa ortalama Silhouette; aksi halde ``silhouette=None``.
 
         Raises:
-            AIModelError: If arguments are invalid or K-Means fails to fit.
+            AIModelError: Geçersiz argüman, ``n_clusters >= n_samples`` (stabilite) veya
+                eğitim hatası.
         """
         if n_clusters < 1:
             raise AIModelError("n_clusters must be at least 1.")
@@ -189,10 +213,11 @@ class AIEngine:
         try:
             X, _ = self._prepare_data(df, numeric_columns=numeric_columns)
             n_samples = int(X.shape[0])
-            if n_clusters > n_samples:
+            if n_clusters >= n_samples:
                 raise AIModelError(
-                    f"n_clusters ({n_clusters}) cannot exceed the number of "
-                    f"rows ({n_samples})."
+                    "Kümeleme ve Silhouette için **satır sayısı, küme sayısından büyük** "
+                    f"olmalıdır (şu an {n_samples} satır, k = {n_clusters}). "
+                    "k değerini düşürün veya daha fazla gözlem ekleyin."
                 )
 
             model = KMeans(
@@ -204,7 +229,7 @@ class AIEngine:
             inertia = float(model.inertia_)
 
             silhouette: float | None = None
-            if n_clusters >= 2 and n_samples >= 2:
+            if n_clusters >= 2 and n_samples > n_clusters:
                 uniq = int(len(np.unique(labels)))
                 if uniq >= 2:
                     try:
@@ -225,34 +250,110 @@ class AIEngine:
 
         return np.asarray(labels, dtype=np.int32), inertia, silhouette
 
+    def cluster_feature_importance_rf(
+        self,
+        df: pd.DataFrame,
+        labels: np.ndarray | pd.Series,
+        numeric_columns: list[str] | None = None,
+        *,
+        n_estimators: int = 200,
+    ) -> pd.DataFrame:
+        """K-Means etiketlerini hedef alarak **Random Forest** özellik önemleri.
+
+        Özellikler :meth:`_prepare_data` ile ölçeklenir; orman, küme kimliğini
+        sınıf etiketi gibi öğrenir ve ``feature_importances_`` ile marjinal
+        katkıyı yaklaşıklar. **Yorum:** K-Means ile tutarlı ama farklı optimizasyon;
+        hangi değişkenlerin ayırıcı olduğuna dair keşifsel ipucu verir.
+
+        Args:
+            df: Model girdi çerçevesi (``analysis_df`` ile uyumlu).
+            labels: Satır ile hizalı küme etiketleri.
+            numeric_columns: Modele giren sayısal sütunlar.
+            n_estimators: Ağaç sayısı (daha fazla → daha kararlı tahmin, daha yavaş).
+
+        Returns:
+            ``feature``, ``importance`` sütunları; ``importance`` satır içi normalize
+            (toplam 1), azalan sıra.
+
+        Raises:
+            AIModelError: Tek küme, yetersiz satır veya eğitim hatası.
+        """
+        y = np.asarray(labels).ravel()
+        if y.shape[0] == 0:
+            raise AIModelError("labels is empty.")
+
+        try:
+            X, use_cols = self._prepare_data(df, numeric_columns=numeric_columns)
+        except AIModelError:
+            raise
+
+        if int(X.shape[0]) != int(y.shape[0]):
+            raise AIModelError("labels length must match DataFrame rows.")
+
+        n_unique = int(len(np.unique(y)))
+        if n_unique < 2:
+            raise AIModelError(
+                "Özellik önemi için en az **iki farklı küme** gerekir (k ≥ 2 ve "
+                "benzersiz etiket)."
+            )
+
+        if int(X.shape[0]) < 4:
+            raise AIModelError(
+                "Random Forest önemi için birkaç gözlemden fazla satır gerekir."
+            )
+
+        try:
+            n_feat = int(X.shape[1])
+            max_depth = min(16, max(3, n_feat * 2))
+            rf = RandomForestClassifier(
+                n_estimators=int(n_estimators),
+                random_state=self._random_state,
+                max_depth=max_depth,
+                class_weight="balanced_subsample",
+            )
+            rf.fit(X, y)
+            imp = np.asarray(rf.feature_importances_, dtype=np.float64)
+            s = float(np.sum(imp))
+            if s > 0:
+                imp = imp / s
+            out = pd.DataFrame(
+                {"feature": use_cols, "importance": imp}
+            ).sort_values("importance", ascending=False, ignore_index=True)
+        except AIModelError:
+            raise
+        except Exception as exc:
+            raise AIModelError(
+                f"Random Forest önem analizi başarısız: {exc}"
+            ) from exc
+
+        return out
+
     def perform_pca(
         self,
         df: pd.DataFrame,
         n_components: int = 2,
         numeric_columns: list[str] | None = None,
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
-        """Linearly project scaled numeric data onto principal components.
+        """Ölçeklenmiş veriyi doğrusal **PCA** alt uzayına yansıtır.
+
+        **Matematiksel problem:** Özellik kovaryansının özdeğer ayrışımına eşdeğer
+        olarak, birincil bileşenler varyansı sırayla maksimize eden ortogonal
+        yönlerdir; projeksiyon bilgi kaybını (yaklaşık) kayıp varyans üzerinden
+        ölçülebilir kılar. ``explained_variance_ratio_`` her bileşenin toplam
+        varyansa (ölçeklenmiş uzayda) oransal katkısıdır.
 
         Args:
-            df: Input table; only inferred numeric columns are used.
-            n_components: Number of components; cannot exceed
-                ``min(n_samples, n_features)``.
-            numeric_columns: Optional subset of inferred numeric column names.
+            df: Girdi tablosu.
+            n_components: Tutulacak bileşen sayısı (en fazla ``min(n, d)``).
+            numeric_columns: İsteğe bağlı sayısal sütun alt kümesi.
 
         Returns:
-            A pair ``(coordinates_df, variance_info)``. The frame has columns
-            ``PC1`` … ``PC{n}``, index aligned with ``df.index``. ``variance_info``
-            contains:
-
-            * ``explained_variance_ratio`` — ``numpy.ndarray``, per-component share
-              of total variance in scaled feature space.
-            * ``cumulative_variance_ratio`` — sum of ratios for the fitted components
-              (fraction of variance captured by this subspace).
-            * ``variance_explained_pct`` — ``100 * cumulative_variance_ratio`` for
-              UI labels (“% of variance along retained PCs”).
+            ``(coordinates_df, variance_info)`` — ``PC1…PCn`` koordinatları ve
+            ``explained_variance_ratio``, ``cumulative_variance_ratio``,
+            ``variance_explained_pct`` anahtarları.
 
         Raises:
-            AIModelError: If ``n_components`` is invalid or PCA fails.
+            AIModelError: Geçersiz ``n_components`` veya SVD/PCA hatası.
         """
         if n_components < 1:
             raise AIModelError("n_components must be at least 1.")
@@ -298,21 +399,23 @@ class AIEngine:
         contamination: float = 0.1,
         numeric_columns: list[str] | None = None,
     ) -> np.ndarray:
-        """Flag outliers using Isolation Forest on scaled numeric features.
+        """Ölçeklenmiş özelliklerde **Isolation Forest** ile aykırı etiketleri üretir.
+
+        **Matematiksel fikir:** Rastgele özellik ve eşik seçimleriyle ağaçlar inşa
+        edilir; nadir ve kısa yoldan izole edilen yapraklara düşen gözlemler aykırı
+        adaylarıdır. ``contamination`` beklenen aykırı oranına dair ön bilgidir
+        (hiperparametre, fiziksel ölçüm değildir).
 
         Args:
-            df: Input table; only inferred numeric columns are used.
-            contamination: Expected proportion of anomalies in ``(0.0, 0.5]``
-                as required by scikit-learn.
-            numeric_columns: Optional subset of inferred numeric column names.
+            df: Girdi tablosu.
+            contamination: scikit-learn kısıtı ``(0, 0.5]``.
+            numeric_columns: İsteğe bağlı sayısal sütun alt kümesi.
 
         Returns:
-            Per-row predictions: ``-1`` anomaly (outlier), ``1`` normal
-            (inlier), same length and order as ``df``.
+            Satır bazında ``-1`` (anomali) veya ``1`` (normal), ``df`` sırasıyla uyumlu.
 
         Raises:
-            AIModelError: If ``contamination`` is outside the allowed interval
-                or fitting fails.
+            AIModelError: ``contamination`` aralık dışı veya eğitim hatası.
         """
         if contamination <= 0.0 or contamination > 0.5:
             raise AIModelError(
@@ -322,6 +425,13 @@ class AIEngine:
 
         try:
             X, _ = self._prepare_data(df, numeric_columns=numeric_columns)
+            n_samples = int(X.shape[0])
+            if n_samples < 2:
+                raise AIModelError(
+                    "Anomali tespiti için en az **2 satır** gerekir; "
+                    "çok küçük örneklemde model kararlı çalışmaz."
+                )
+
             model = IsolationForest(
                 contamination=contamination,
                 random_state=self._random_state,

@@ -1,17 +1,22 @@
-"""Custom exceptions for the data processing and ML pipeline."""
+"""ML ve ön işlem boru hattı için ayrıştırılmış istisna türleri.
+
+Her sınıf, hatanın **hangi aşamada** (dosya okuma, doğrulama, model) oluştuğunu
+belirlemeye yarar; arayüzde kullanıcıya kısa mesaj, geliştiriciye log ayrımı
+yapılabilir.
+"""
 
 
 class ProcessorError(Exception):
-    """Base exception for failures in loading, cleaning, or validating data."""
+    """Yükleme, temizleme veya tablo doğrulama aşamasında oluşan temel hata."""
 
 
 class DataLoadError(ProcessorError):
-    """Raised when an uploaded file cannot be read, parsed, or is invalid."""
+    """Dosya biçimi, boş içerik veya ayrıştırma başarısız olduğunda fırlatılır."""
 
 
 class PreprocessingError(ProcessorError):
-    """Raised when a DataFrame fails validation or cannot be cleaned."""
+    """``DataFrame`` şeması / boşluk / temizleme kuralları ihlal edildiğinde."""
 
 
 class AIModelError(Exception):
-    """Raised when scaling, fitting, or inference in the ML engine fails."""
+    """Ölçekleme, uyum (fit) veya çıkarım sırasında ML çekirdeğinde oluşan hata."""
