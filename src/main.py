@@ -26,7 +26,7 @@ from visualizer import DataVisualizer
 
 # --- Merkezi ayarlar (bakım / tema / varsayılanlar) -----------------------------
 CONFIG: dict[str, Any] = {
-    "VERSION": "0.5.0",
+    "VERSION": "0.7.0",
     "UI": {
         "PAGE_TITLE": "AI Visualizer",
         "PAGE_LAYOUT": "wide",
@@ -46,8 +46,8 @@ CONFIG: dict[str, Any] = {
         "SUCCESS_DEMO": "Örnek veri yüklendi: **{dataset}**.",
         "BTN_DOWNLOAD_REPORT": "Akademik analiz raporunu indir",
         "REPORT_FILENAME_PREFIX": "akademik_analiz_raporu",
-        "APP_TITLE_ICON": "🎯",
-        "TAB_ICONS": ["📄", "📈", "🧹", "📊", "📋"],
+        "APP_TITLE_ICON": "◆",
+        "TAB_ICONS": ["📋", "📑", "✨", "🧪", "🎯"],
         "TABS": [
             "Raw preview",
             "Summary stats",
@@ -60,10 +60,24 @@ CONFIG: dict[str, Any] = {
         "CHECKBOX_ACADEMIC_TIPS_HELP": (
             "Her analiz altında jüriye okuyabileceğiniz kısa teknik notlar (sunum modu)."
         ),
-        "REPORT_PREVIEW_EXPANDER": "📄 İndirilecek Rapor İçeriğini Önizle",
+        "REPORT_PREVIEW_EXPANDER": "📄 İndirilecek rapor önizlemesi",
+        "REPORT_STRATEGY_SECTION_MD": "## 🤖 AI Stratejik Tavsiyeler",
         "FOOTER_TEXT": (
-            "v0.5.0 Final Release | Mehmet Özerli - Bitirme Projesi"
+            "v0.7.0 | Mehmet Özerli — Vizyoner özellikler (görüntü simülatörü, kalite radarı, strateji motoru)"
         ),
+        "DATA_MODE_LABEL": "Veri Türü Seçin",
+        "DATA_MODES": {
+            "tabular": "📊 Tabüler (Klasik Excel/CSV)",
+            "text_corpus": "✍️ Metin Derlemi (Text Corpus)",
+            "audio_features": "🔊 Ses Özellikleri (Audio Features)",
+            "image_features": "🖼️ Görüntü Koleksiyonu (İndeks 3)",
+        },
+        "UPLOADER_HELP_BY_MODE": {
+            "tabular": "CSV veya Excel (.xlsx). Excel için openpyxl gerekir.",
+            "text_corpus": ".txt — birden fazla belge için paragraflar arasında boş satırlar (3+ newline) kullanın.",
+            "audio_features": "Yer tutucu dosya (.txt/.csv). Gerçek WAV ayrıştırması yok; dosya adında 'audio' geçerse tohum farklılaşır.",
+            "image_features": "Yer tutucu dosya. 100 görsel satırı simüle edilir; gerçekte CNN veya OpenCV özellikleri beslenir.",
+        },
     },
     "MODEL": {
         "DEFAULT_K_MEANS_CAP": 3,
@@ -90,6 +104,11 @@ CONFIG: dict[str, Any] = {
         ),
         "CAPTION_PICK_TWO_COLUMNS": "Analiz için en az iki sayısal sütun seçin.",
         "CAPTION_ANALYSIS_EMPTY": "Sonuçları görmek için **Analizi Çalıştır** düğmesine basın.",
+        "MSG_VECTORIZED_PIPELINE": (
+            "**Not:** Bu veriler analiz için vektörleştirilmiştir (sayısal özellik satırları). "
+            "Ham metin, ses dalga formu veya ham görüntü pikseli doğrudan kullanılmaz; türetilmiş "
+            "sütunlar üzerinden kümeleme / PCA / anomali çalışır."
+        ),
     },
     "PRESENTATION_TIPS": {
         "correlation": (
@@ -136,10 +155,18 @@ CONFIG: dict[str, Any] = {
             "ayrıldığını kanıtlar."
         ),
     },
+    "FILE_TYPES_BY_MODE": {
+        "tabular": ["csv", "xlsx", "xlsm"],
+        "text_corpus": ["txt"],
+        "audio_features": ["txt", "csv", "xlsx"],
+        "image_features": ["txt", "csv", "xlsx"],
+    },
     "SESSION_KEYS": {
         "FILE_UPLOADER": "wv_dataset_upload",
         "FEATURE_DIST_COLUMN": "feature_dist_column",
         "DEMO_SAMPLE": "wv_demo_sample",
+        "DATA_MODE": "wv_data_mode",
+        "TEXT_CORPUS_BLOB": "_wv_text_corpus_display",
     },
     "PLOTLY": {
         "CHART_CONFIG": {
@@ -198,6 +225,81 @@ _DEMO_DATASET_LABELS: dict[str, str] = {
     "anomaly_synthetic": "Anomali Test Seti (Sentetik)",
 }
 
+_DATA_MODE_ORDER: tuple[str, ...] = (
+    "tabular",
+    "text_corpus",
+    "audio_features",
+    "image_features",
+)
+
+# Örnek veri yüklemede modu tabüler yap: selectbox oluşmadan önce işlenir (widget anahtarı yazılamaz).
+_DEMO_FORCE_TABULAR_KEY = "_wv_demo_force_tabular"
+
+
+def _normalize_data_mode_index(sess_key: str) -> None:
+    """``wv_data_mode`` artık 0…n-1 indeks tutar; eski oturumlardaki string değeri dönüştür."""
+    raw = st.session_state.get(sess_key)
+    if raw is None:
+        st.session_state[sess_key] = 0
+        return
+    if isinstance(raw, str):
+        try:
+            st.session_state[sess_key] = _DATA_MODE_ORDER.index(raw)
+        except ValueError:
+            st.session_state[sess_key] = 0
+        return
+    try:
+        idx = int(raw)
+    except (TypeError, ValueError):
+        st.session_state[sess_key] = 0
+        return
+    if not (0 <= idx < len(_DATA_MODE_ORDER)):
+        st.session_state[sess_key] = 0
+
+
+def _data_mode_id(sess_key: str) -> str:
+    """Seçili veri modu kimliği (``tabular``, ``text_corpus``, …)."""
+    _normalize_data_mode_index(sess_key)
+    return _DATA_MODE_ORDER[int(st.session_state[sess_key])]
+
+
+def _extensions_for_data_mode(mode: str) -> list[str]:
+    m = CONFIG["FILE_TYPES_BY_MODE"].get(
+        mode, CONFIG["FILE_TYPES_BY_MODE"]["tabular"]
+    )
+    return list(m)
+
+
+def _render_wordcloud_section(text_blob: str) -> None:
+    """Metin derlemi için kelime bulutu (wordcloud + matplotlib)."""
+    blob = (text_blob or "").strip()
+    if len(blob) < 12:
+        st.caption("Kelime bulutu için metin çok kısa.")
+        return
+    try:
+        import matplotlib.pyplot as plt
+        from wordcloud import WordCloud
+    except ImportError:
+        st.info(
+            "Kelime bulutu için `wordcloud` paketini yükleyin: `pip install wordcloud`."
+        )
+        return
+    try:
+        wc = WordCloud(
+            width=900,
+            height=420,
+            background_color="white",
+            colormap="viridis",
+            max_words=120,
+        ).generate(blob)
+        fig, ax = plt.subplots(figsize=(11, 4.6))
+        ax.imshow(wc, interpolation="bilinear")
+        ax.axis("off")
+        st.pyplot(fig, clear_figure=True)
+        plt.close(fig)
+    except ValueError:
+        st.caption("Kelime bulutu üretilemedi.")
+
 
 def _streamlit_theme() -> Literal["light", "dark"]:
     """Map Streamlit host theme to a simple light/dark flag for Plotly."""
@@ -247,6 +349,8 @@ def _reset_app_session() -> None:
         CONFIG["SESSION_KEYS"]["FILE_UPLOADER"],
         CONFIG["SESSION_KEYS"]["FEATURE_DIST_COLUMN"],
         CONFIG["SESSION_KEYS"]["DEMO_SAMPLE"],
+        CONFIG["SESSION_KEYS"]["TEXT_CORPUS_BLOB"],
+        CONFIG["SESSION_KEYS"]["DATA_MODE"],
     )
     for k in keys_to_drop:
         st.session_state.pop(k, None)
@@ -484,6 +588,155 @@ def _render_model_interpreter(result: dict[str, Any]) -> None:
         st.info("**Model yorumlayıcı**\n\n" + "\n\n".join(lines))
 
 
+def _inject_theme_aware_code_css() -> None:
+    """Rapor önizlemesindeki ``st.code`` / kod bloklarını Streamlit temasıyla hizalar."""
+    st.markdown(
+        """
+        <style>
+        .stCodeBlock, .stCodeBlock pre, .stCodeBlock code,
+        div[data-testid="stCode"] pre, div[data-testid="stCode"] code {
+            background-color: var(--secondary-background-color) !important;
+            color: var(--text-color) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _column_uniqueness_score(raw_df: pd.DataFrame) -> float:
+    """Sütun başına benzersiz değer oranının ortalaması (0–100)."""
+    if raw_df.empty or raw_df.shape[1] == 0:
+        return 50.0
+    n = len(raw_df)
+    ratios: list[float] = []
+    for c in raw_df.columns:
+        nu = int(raw_df[c].nunique(dropna=True))
+        ratios.append(min(1.0, nu / max(1, n)))
+    return float(100.0 * (sum(ratios) / len(ratios)))
+
+
+def _variance_balance_score(raw_df: pd.DataFrame) -> float:
+    """Sayısal sütunların varyanslarının göreli dengesi (düşük CV → yüksek skor, 0–100)."""
+    num_cols, _ = DataLoader.infer_column_types(raw_df)
+    if len(num_cols) < 2:
+        return 65.0
+    vars_list: list[float] = []
+    for c in num_cols:
+        s = pd.to_numeric(raw_df[c], errors="coerce").dropna()
+        if len(s) < 2:
+            continue
+        v = float(s.var(ddof=0))
+        if np.isfinite(v) and v >= 0.0:
+            vars_list.append(max(v, 1e-18))
+    if len(vars_list) < 2:
+        return 60.0
+    arr = np.asarray(vars_list, dtype=float)
+    mean_v = float(np.mean(arr))
+    if mean_v < 1e-15:
+        return 50.0
+    cv = float(np.std(arr, ddof=0) / mean_v)
+    return float(max(0.0, min(100.0, 100.0 * (1.0 - min(cv / 2.5, 1.0)))))
+
+
+def _numeric_feature_richness_score(n_numeric: int, *, sweet: int = 12) -> float:
+    """Modele girebilecek sayısal sütun sayısı için 0–100 zenginlik skoru."""
+    if n_numeric < 1:
+        return 25.0
+    if n_numeric >= sweet:
+        return 100.0
+    return float(25.0 + 75.0 * (n_numeric - 1) / max(1, sweet - 1))
+
+
+def _data_quality_radar_axes(
+    qm: dict[str, Any],
+    raw_df: pd.DataFrame,
+    result: dict[str, Any] | None,
+    n_numeric_features: int,
+) -> list[tuple[str, float]]:
+    """Kalite radarı: altı eksen (0–100)."""
+    uniq = _column_uniqueness_score(raw_df)
+    var_bal = _variance_balance_score(raw_df)
+    feat_rich = _numeric_feature_richness_score(n_numeric_features)
+    anomaly_scarcity = 72.0
+    if result is not None:
+        pred = result.get("pred")
+        if pred is not None:
+            p = np.asarray(pred).ravel()
+            n = int(len(p))
+            if n > 0:
+                n_an = int((p == -1).sum())
+                pct_an = 100.0 * n_an / float(n)
+                anomaly_scarcity = max(0.0, min(100.0, 100.0 - pct_an))
+    imput_score = max(
+        0.0, 100.0 - float(qm.get("pct_imputed_of_total", 0.0))
+    )
+    return [
+        ("Doluluk oranı", float(qm["pct_filled"])),
+        ("Benzersizlik", uniq),
+        ("Anomali azlığı", anomaly_scarcity),
+        ("Varyans dengesi", var_bal),
+        ("Özellik sayısı", feat_rich),
+        ("Düşük imputasyon yükü", imput_score),
+    ]
+
+
+def _build_ai_strategy_advice_md(
+    result: dict[str, Any],
+    n_obs: int,
+    *,
+    data_mode_id: str = "tabular",
+) -> str:
+    """Kural tabanlı strateji metni (Insight Engine — rapor sonu ve analiz sekmesi)."""
+    thr = CONFIG["INTERPRETER"]
+    bullets: list[str] = []
+    sil = result.get("silhouette")
+    if sil is not None and float(sil) > float(thr["SILHOUETTE_STRONG"]):
+        bullets.append(
+            "Segmentasyon kalitesi yüksek, **hedef kitle operasyonlarına** başlanabilir."
+        )
+    elif sil is not None and float(sil) < float(thr["SILHOUETTE_WEAK"]):
+        bullets.append(
+            "Küme ayrışması zayıf; **k**, özellik seçimi veya ön işlemi (ölçekleme / log) "
+            "gözden geçirilmeli."
+        )
+    pred = result.get("pred")
+    if pred is not None and n_obs > 0:
+        p = np.asarray(pred).ravel()
+        pct_an = 100.0 * float((p == -1).sum()) / float(len(p))
+        if pct_an > 10.0:
+            bullets.append(
+                "Veri giriş süreçlerinde **yüksek gürültü** tespit edildi; "
+                "**sensör kalibrasyonu** veya kayıt hattı kontrolü gerekebilir "
+                f"(aykırı oranı ~%{pct_an:.1f})."
+            )
+        elif pct_an > 5.0:
+            bullets.append(
+                f"Aykırı oranı **%{pct_an:.1f}** — kaynak kalitesini izlemek faydalıdır."
+            )
+    if data_mode_id == "image_features" and n_obs > 0:
+        bullets.append(
+            "Görsel benzerlik kümeleri tutarlı görünüyor; **otomatik etiketleme** veya "
+            "görüntü arşiv segmentasyonu değerlendirilebilir."
+        )
+    pv = result.get("pca_variance_pct")
+    if pv is not None and float(pv) < float(thr["PCA_LOW_VARIANCE_PCT"]):
+        bullets.append(
+            "İlk iki PCA bileşeni düşük varyans açıklıyor; ek bileşen veya doğrusal olmayan "
+            "yöntemler tartışılabilir."
+        )
+    if not bullets:
+        bullets.append(
+            "Bu çalıştırmada güçlü uyarı üretilmedi; sonuçları domain bilgisi ve iş hedefleriyle "
+            "birlikte yorumlayın."
+        )
+    body = "\n".join(f"- {b}" for b in bullets)
+    return (
+        body
+        + "\n\n*Kural tabanlı önerilerdir; üretken yapay zeka (LLM) çıktısı değildir.*"
+    )
+
+
 def _dataframe_to_markdown_table(df: pd.DataFrame, *, float_decimals: int) -> str:
     """tabulate bağımlılığı olmadan basit Markdown tablo (UTF-8 rapor için)."""
     if df.empty:
@@ -521,6 +774,7 @@ def _build_academic_report_markdown(
     cluster_profile_df: pd.DataFrame | None = None,
     use_log_transform: bool = False,
     log_skipped_columns: list[str] | None = None,
+    data_mode_id: str = "tabular",
 ) -> str:
     """Savunma / jüri için Markdown metin raporu (indirme .txt)."""
     parts: list[str] = [
@@ -608,8 +862,22 @@ def _build_academic_report_markdown(
     if result.get("err_elbow"):
         err_parts.append(f"- **Dirsek taraması:** {result['err_elbow']}")
     parts.extend(err_parts if err_parts else ["- Kayıtlı hata yok."])
+    strat_title = str(
+        CONFIG.get("UI", {}).get(
+            "REPORT_STRATEGY_SECTION_MD",
+            "## 🤖 AI Stratejik Tavsiyeler",
+        )
+    )
     parts.extend(
         [
+            "",
+            strat_title,
+            "",
+            _build_ai_strategy_advice_md(
+                result,
+                len(analysis_df),
+                data_mode_id=data_mode_id,
+            ),
             "",
             "---",
             "*Bu rapor, analiz sekmesindeki o anki oturum çıktılarından üretilmiştir.*",
@@ -631,6 +899,7 @@ def main() -> None:
         page_title=f'{ui["PAGE_TITLE"]} v{CONFIG["VERSION"]}',
         layout=ui["PAGE_LAYOUT"],
     )
+    _inject_theme_aware_code_css()
     icon = ui.get("APP_TITLE_ICON", "")
     st.title(f"{icon} {ui['APP_TITLE']}".strip() if icon else ui["APP_TITLE"])
     st.caption(ui["APP_CAPTION"])
@@ -639,8 +908,19 @@ def main() -> None:
     loader = DataLoader()
     uploaded = None
 
+    dm_sess = sess["DATA_MODE"]
+    if st.session_state.pop(_DEMO_FORCE_TABULAR_KEY, False):
+        st.session_state[dm_sess] = 0
+    _normalize_data_mode_index(dm_sess)
+
     with st.sidebar:
         st.markdown("**Hızlı başlangıç**")
+        st.selectbox(
+            ui["DATA_MODE_LABEL"],
+            options=list(range(len(_DATA_MODE_ORDER))),
+            format_func=lambda i: ui["DATA_MODES"][_DATA_MODE_ORDER[int(i)]],
+            key=dm_sess,
+        )
         demo_choice = st.selectbox(
             ui["DEMO_LABEL"],
             options=list(_DEMO_DATASET_LABELS.keys()),
@@ -653,27 +933,97 @@ def main() -> None:
             use_container_width=True,
         ):
             st.session_state[demo_key] = demo_choice
+            st.session_state[_DEMO_FORCE_TABULAR_KEY] = True
+            st.session_state.pop(sess["TEXT_CORPUS_BLOB"], None)
             st.session_state.pop(sess["FILE_UPLOADER"], None)
             st.rerun()
 
+        _mode_now = _data_mode_id(dm_sess)
         uploaded = st.file_uploader(
             ui["FILE_UPLOADER_LABEL"],
-            type=list(ui["FILE_EXTENSIONS"]),
-            help=ui["FILE_UPLOADER_HELP"],
+            type=_extensions_for_data_mode(_mode_now),
+            help=ui["UPLOADER_HELP_BY_MODE"].get(
+                _mode_now, ui["FILE_UPLOADER_HELP"]
+            ),
             key=sess["FILE_UPLOADER"],
         )
+
+    mode_load = _data_mode_id(dm_sess)
 
     if uploaded is not None:
         st.session_state.pop(demo_key, None)
         try:
-            df = loader.load_file(uploaded)
+            if mode_load == "text_corpus":
+                raw_bytes = uploaded.read()
+                df, text_preview = DataLoader.process_text_file(raw_bytes)
+                st.session_state[sess["TEXT_CORPUS_BLOB"]] = text_preview
+                upload_fingerprint = (
+                    f"text_corpus:{uploaded.name}:"
+                    f"{getattr(uploaded, 'size', 0)}"
+                )
+            elif mode_load == "audio_features":
+                st.session_state.pop(sess["TEXT_CORPUS_BLOB"], None)
+                name_l = (uploaded.name or "").lower()
+                nm_audio = uploaded.name or "audio_placeholder"
+                if "audio" in name_l:
+                    st.caption(
+                        "Dosya adında **audio** geçti — simülasyon tohumu buna göre "
+                        "ayarlanır (gerçek WAV ayrıştırması yok)."
+                    )
+                _seed_a = abs(hash(nm_audio.lower())) % (2**31 - 1)
+                if "audio" in name_l:
+                    _seed_a ^= 0x1A2B3C4D
+                df = DataLoader.simulate_audio_features(
+                    n_rows=120,
+                    seed=_seed_a,
+                    name_hint=nm_audio,
+                )
+                upload_fingerprint = (
+                    f"audio_sim:{uploaded.name}:"
+                    f"{getattr(uploaded, 'size', 0)}"
+                )
+            elif mode_load == "image_features":
+                st.session_state.pop(sess["TEXT_CORPUS_BLOB"], None)
+                name_li = (uploaded.name or "").lower()
+                nm_img = uploaded.name or "image_placeholder"
+                if "image" in name_li or "img" in name_li:
+                    st.caption(
+                        "Dosya adında **image** / **img** geçti — simülasyon tohumu "
+                        "buna göre ayarlanır (gerçek CNN/OpenCV çıkarımı yok)."
+                    )
+                _seed_i = abs(hash(nm_img.lower())) % (2**31 - 1)
+                if "image" in name_li:
+                    _seed_i ^= 0x5EEDFACE
+                elif "img" in name_li:
+                    _seed_i ^= 0x10CA6001
+                df = DataLoader.simulate_image_features(
+                    n_rows=100,
+                    seed=_seed_i,
+                    name_hint=nm_img,
+                )
+                upload_fingerprint = (
+                    f"image_sim:{uploaded.name}:"
+                    f"{getattr(uploaded, 'size', 0)}"
+                )
+            else:
+                st.session_state.pop(sess["TEXT_CORPUS_BLOB"], None)
+                df = loader.load_file(uploaded)
+                upload_fingerprint = (
+                    f"tabular:{uploaded.name}:"
+                    f"{getattr(uploaded, 'size', 0)}"
+                )
         except DataLoadError as exc:
             st.error(str(exc))
             return
-        upload_fingerprint = f"{uploaded.name}:{getattr(uploaded, 'size', 0)}"
         st.success(
             f"Yüklendi: **{len(df)}** satır, **{len(df.columns)}** sütun."
         )
+        if mode_load == "image_features":
+            st.caption(
+                "Sunum notu: Gerçek projede bu verileri **evrişimli sinir ağları (CNN)** "
+                "veya **OpenCV** ile çıkarıp sistemimize besliyoruz; burada 100 görsel satırı "
+                "**simüle** edilmiştir."
+            )
     elif st.session_state.get(demo_key):
         try:
             dkey = str(st.session_state[demo_key])
@@ -681,6 +1031,7 @@ def main() -> None:
         except (ImportError, OSError, ValueError) as exc:
             st.error(f"Örnek veri yüklenemedi: {exc}")
             return
+        st.session_state.pop(sess["TEXT_CORPUS_BLOB"], None)
         if dkey == "anomaly_synthetic":
             upload_fingerprint = "demo:anomaly_synthetic:numpy"
             demo_src = "100 normal + 5 aykırı nokta (NumPy)"
@@ -717,7 +1068,7 @@ def main() -> None:
     elbow_cap = max(2, min(int(model["ELBOW_K_MAX_UPPER"]), max(1, n_rows_model - 1)))
 
     with st.sidebar:
-        with st.expander("📂 Veri Kaynağı & Filtreleme", expanded=True):
+        with st.expander("🗂️ Veri Kaynağı & Filtreleme", expanded=True):
             src_lbl = (
                 uploaded.name
                 if uploaded is not None
@@ -737,7 +1088,7 @@ def main() -> None:
                 if len(selected_numeric) < int(model["MIN_NUMERIC_FEATURES"]):
                     st.caption(msg["CAPTION_PICK_TWO_COLUMNS"])
 
-        with st.expander("⚙️ Model Parametreleri", expanded=True):
+        with st.expander("⚡ Model Parametreleri", expanded=True):
             n_clusters = st.number_input(
                 "Küme sayısı (K-Means)",
                 min_value=1,
@@ -784,7 +1135,7 @@ def main() -> None:
                 ),
             )
 
-        with st.expander("👨‍💻 Geliştirici Hakkında", expanded=False):
+        with st.expander("🧑‍💻 Geliştirici Hakkında", expanded=False):
             st.markdown(f"**{dev['NAME']}**")
             st.markdown(dev["SCHOOL"])
             st.markdown(dev["TECH_STACK"])
@@ -825,6 +1176,7 @@ def main() -> None:
         int(n_clusters),
         round(float(contamination), 4),
         bool(use_log_transform),
+        _data_mode_id(dm_sess),
     )
     if st.session_state.get("_feature_selection_key") != feature_selection_key:
         st.session_state.pop("analiz_result", None)
@@ -839,6 +1191,27 @@ def main() -> None:
     tab_raw, tab_stats, tab_clean, tab_analiz, tab_exec = st.tabs(tab_labels_ui)
 
     with tab_raw:
+        st.markdown("#### Kalite özeti (radar)")
+        st.caption(
+            "Yönetsel bakış: doluluk, benzersizlik, anomali azlığı (analiz sonrası güncellenir), "
+            "varyans dengesi, sayısal özellik zenginliği ve imputasyon yükü."
+        )
+        try:
+            qm_preview = DataLoader.compute_fill_quality_metrics(df, cleaned)
+            res_prev = st.session_state.get("analiz_result")
+            axes_prev = _data_quality_radar_axes(
+                qm_preview,
+                df,
+                res_prev,
+                len(numeric_for_model),
+            )
+            fig_prev = DataVisualizer(theme=_streamlit_theme()).plot_data_quality_radar(
+                axes_prev,
+                title="Veri kalitesi radarı",
+            )
+            _render_plotly_static(fig_prev, key="wv_plot_quality_radar_raw")
+        except (PreprocessingError, ValueError, KeyError, TypeError):
+            st.caption("Kalite radarı bu veri için hesaplanamadı.")
         st.dataframe(
             df.head(int(prev["RAW_CLEAN_HEAD"])),
             use_container_width=True,
@@ -885,6 +1258,9 @@ def main() -> None:
 
     with tab_analiz:
         st.subheader("Analiz Paneli")
+        _dm_tab = _data_mode_id(dm_sess)
+        if _dm_tab != "tabular":
+            st.info(msg["MSG_VECTORIZED_PIPELINE"])
         if cleaned is None and clean_error is not None:
             st.warning(
                 "Temizleme uygulanamadı; analiz **ham veri** üzerinde çalışacak. "
@@ -1027,6 +1403,15 @@ def main() -> None:
         result: dict[str, Any] | None = st.session_state.get("analiz_result")
         if result is None:
             st.caption(msg["CAPTION_ANALYSIS_EMPTY"])
+            if _data_mode_id(dm_sess) == "text_corpus":
+                _b0 = st.session_state.get(sess["TEXT_CORPUS_BLOB"])
+                if _b0:
+                    st.markdown("### Kelime bulutu (metin derlemi özeti)")
+                    st.caption(
+                        "Analizi çalıştırmadan önce ham metin önizlemesi; "
+                        "model girdisi aşağıdaki sayısal özelliklerdir."
+                    )
+                    _render_wordcloud_section(str(_b0))
         else:
             viz = DataVisualizer(theme=_streamlit_theme())
             tips_cfg: dict[str, str] = CONFIG.get("PRESENTATION_TIPS", {})
@@ -1436,6 +1821,16 @@ def main() -> None:
             except ValueError as exc:
                 st.warning(str(exc))
 
+            if _data_mode_id(dm_sess) == "text_corpus":
+                _wc_blob = st.session_state.get(sess["TEXT_CORPUS_BLOB"])
+                if _wc_blob:
+                    st.markdown("### Kelime bulutu (metin derlemi özeti)")
+                    st.caption(
+                        "Ham metinden türetilen önizleme; kümeleme ve PCA sayısal "
+                        "özellik sütunları üzerindedir."
+                    )
+                    _render_wordcloud_section(str(_wc_blob))
+
             st.divider()
             report_md = _build_academic_report_markdown(
                 result=result,
@@ -1448,16 +1843,22 @@ def main() -> None:
                 cluster_profile_df=analysis_base,
                 use_log_transform=bool(result.get("use_log_transform")),
                 log_skipped_columns=list(result.get("log_skipped_columns") or []),
+                data_mode_id=_data_mode_id(dm_sess),
             )
             with st.expander(
                 ui.get(
                     "REPORT_PREVIEW_EXPANDER",
-                    "📄 İndirilecek Rapor İçeriğini Önizle",
+                    "📜 İndirilecek Rapor İçeriğini Önizle",
                 ),
                 expanded=False,
             ):
-                st.caption("Aşağıdaki metin indirilecek `.txt` dosyasıyla aynıdır (Markdown).")
+                st.caption(
+                    "Aşağıdaki metin indirilecek `.txt` dosyasıyla aynıdır (Markdown)."
+                )
+                st.markdown("**Biçimli önizleme**")
                 st.markdown(report_md)
+                st.markdown("**Ham Markdown kaynağı** (`language=\"markdown\"`)")
+                st.code(report_md, language="markdown")
             st.download_button(
                 label=ui["BTN_DOWNLOAD_REPORT"],
                 data=report_md.encode("utf-8"),
@@ -1466,6 +1867,19 @@ def main() -> None:
                 help="Silhouette, PCA, sütunlar, küme ortalamaları ve model yorumları (Markdown, .txt).",
                 use_container_width=True,
                 key="wv_download_academic_report",
+            )
+            st.markdown(
+                CONFIG.get("UI", {}).get(
+                    "REPORT_STRATEGY_SECTION_MD",
+                    "## 🤖 AI Stratejik Tavsiyeler",
+                )
+            )
+            st.markdown(
+                _build_ai_strategy_advice_md(
+                    result,
+                    len(analysis_df),
+                    data_mode_id=_data_mode_id(dm_sess),
+                )
             )
 
     with tab_exec:

@@ -697,3 +697,61 @@ class DataVisualizer:
         )
         fig.update_layout(legend_title_text="Küme")
         return fig
+
+    def plot_data_quality_radar(
+        self,
+        axis_values: list[tuple[str, float]],
+        *,
+        title: str | None = None,
+        chart_height: int | None = None,
+    ) -> Figure:
+        """Veri kalitesi göstergelerini 0–100 ölçeğinde radar (örümcek ağı) grafiği.
+
+        Args:
+            axis_values: ``(eksen etiketi, skor 0…100)`` çiftleri; en az üç, tipik olarak beş–altı eksen.
+            title: Grafik başlığı.
+            chart_height: Piksel yüksekliği.
+
+        Returns:
+            ``plotly.graph_objects.Figure`` (``Scatterpolar``).
+
+        Raises:
+            ValueError: Boş veya çok kısa eksen listesi.
+        """
+        if not axis_values or len(axis_values) < 3:
+            raise ValueError("axis_values must contain at least three (label, score) pairs.")
+        labels = [str(t[0]) for t in axis_values]
+        vals = [float(max(0.0, min(100.0, t[1]))) for t in axis_values]
+        labels_closed = labels + [labels[0]]
+        vals_closed = vals + [vals[0]]
+
+        line_color = "#818CF8" if self._theme == "dark" else "#4F46E5"
+        fill_rgba = "rgba(129,140,248,0.35)" if self._theme == "dark" else "rgba(79,70,229,0.28)"
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatterpolar(
+                r=vals_closed,
+                theta=labels_closed,
+                fill="toself",
+                fillcolor=fill_rgba,
+                line=dict(color=line_color, width=2),
+                name="Kalite skoru",
+                hovertemplate="%{theta}: %{r:.1f}<extra></extra>",
+            )
+        )
+        rad_title = title if title is not None else "Veri kalitesi radarı (0–100)"
+        h = int(chart_height) if chart_height is not None else 480
+        fig.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    range=[0, 100],
+                    tickvals=[0, 25, 50, 75, 100],
+                ),
+                angularaxis=dict(rotation=90, direction="counterclockwise"),
+            ),
+            showlegend=False,
+            **self._base_layout(rad_title, "", "", height=h),
+        )
+        return fig

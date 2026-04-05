@@ -1,5 +1,6 @@
 """
-Yapılandırılmış veri yükleme, şema çıkarımı, özet ve eksik değer temizliği.
+Yapılandırılmış veri yükleme, şema çıkarımı, özet ve eksik değer temizliği;
+isteğe bağlı metin derlemi (NLP Lite) ve simüle ses özellik tablosu.
 
 :class:`DataLoader` CSV/Excel okuma ve ML öncesi ön işlemi kapsar. İmputation
 kuralları istatistiksel (ortalama, mod, medyan) ve semantiktir; **eksik verinin
@@ -9,6 +10,7 @@ bir tablo üretmektir.
 
 from __future__ import annotations
 
+import re
 from io import BytesIO
 from pathlib import PurePath
 from typing import Any, BinaryIO
@@ -21,6 +23,48 @@ from exceptions import DataLoadError, PreprocessingError
 # Minimum ratio of non-null values that must parse as numeric for an object
 # column to be treated as numeric (avoids misclassifying IDs with few digits).
 _NUMERIC_STRING_RATIO: float = 0.95
+
+# Basit duygu sözlüğü (İngilizce + Türkçe); yoğunluk skoru keşifseldir, model değildir.
+_SENTIMENT_POSITIVE: frozenset[str] = frozenset(
+    {
+        "good",
+        "great",
+        "excellent",
+        "happy",
+        "love",
+        "positive",
+        "best",
+        "amazing",
+        "wonderful",
+        "nice",
+        "iyi",
+        "güzel",
+        "harika",
+        "mutlu",
+        "mükemmel",
+        "süper",
+    }
+)
+_SENTIMENT_NEGATIVE: frozenset[str] = frozenset(
+    {
+        "bad",
+        "terrible",
+        "awful",
+        "hate",
+        "negative",
+        "worst",
+        "sad",
+        "angry",
+        "poor",
+        "ugly",
+        "kötü",
+        "berbat",
+        "üzgün",
+        "korkunç",
+        "nefret",
+        "fena",
+    }
+)
 
 
 class DataLoader:
@@ -92,6 +136,198 @@ class DataLoader:
             raise DataLoadError("File contains no rows.")
 
         return df
+
+    @staticmethod
+    def _tokenize_words(text: str) -> list[str]:
+        """Unicode kelimeleri küçük harfe indirger (basit tokenizer)."""
+        return re.findall(r"[\w']+", text.lower(), flags=re.UNICODE)
+
+    @staticmethod
+    def _text_document_features(doc: str) -> dict[str, float]:
+        """
+        Tek belge için sayısal özellikler: uzunluk, çeşitlilik, cümle başına kelime,
+        sözlük tabanlı duygu skoru (yaklaşık −1…1).
+        """
+        doc = (doc or "").strip()
+        words = DataLoader._tokenize_words(doc)
+        n_w = len(words)
+        if n_w == 0:
+            return {
+                "word_count": 0.0,
+                "unique_word_ratio": 0.0,
+                "avg_sentence_length": 0.0,
+                "sentiment_score": 0.0,
+            }
+        uniq_ratio = float(len(set(words))) / float(n_w)
+        parts = re.split(r"[.!?]+", doc)
+        parts = [p.strip() for p in parts if p.strip()]
+        if not parts:
+            avg_sent = float(n_w)
+        else:
+            lens = [len(DataLoader._tokenize_words(p)) for p in parts]
+            avg_sent = float(np.mean(lens)) if lens else float(n_w)
+        pos_hits = sum(1 for w in words if w in _SENTIMENT_POSITIVE)
+        neg_hits = sum(1 for w in words if w in _SENTIMENT_NEGATIVE)
+        sentiment = (pos_hits - neg_hits) / float(max(n_w, 1))
+        sentiment = float(max(-1.0, min(1.0, sentiment * 5.0)))
+        return {
+            "word_count": float(n_w),
+            "unique_word_ratio": float(uniq_ratio),
+            "avg_sentence_length": float(avg_sent),
+            "sentiment_score": float(sentiment),
+        }
+
+    @staticmethod
+    def process_text_file(
+        raw: bytes,
+        *,
+        encoding: str = "utf-8",
+        document_separator_pattern: str | None = r"\n{3,}",
+    ) -> tuple[pd.DataFrame, str]:
+        """
+        Ham metin dosyasını belge satırlarına ve sayısal özelliklere dönüştürür (NLP Lite).
+
+        Çoklu belge: varsayılan olarak üç veya daha fazla ardışık satım sonu ile ayrılır.
+        Her belge bir satır; ``doc_id`` indeks olur. İkinci dönüş, kelime bulutu vb. için
+        birleştirilmiş metin (üst sınırlı).
+
+        Parameters
+        ----------
+        raw
+            Dosya içeriği (bayt).
+        encoding
+            Metin kodlaması.
+        document_separator_pattern
+            ``re.split`` deseni; ``None`` ise tüm dosya tek belge.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, str]
+            Özellik çerçevesi (yalnızca sayısal sütunlar) ve önizleme metni.
+
+        Raises
+        ------
+        DataLoadError
+            Boş veya ayrıştırılamaz içerik.
+        """
+        if not raw:
+            raise DataLoadError("Text file is empty.")
+        try:
+            text = raw.decode(encoding, errors="replace")
+        except LookupError as exc:
+            raise DataLoadError(f"Unknown text encoding: {encoding!r}.") from exc
+
+        text = text.strip()
+        if not text:
+            raise DataLoadError("Text file contains no usable characters.")
+
+        if document_separator_pattern:
+            parts = re.split(document_separator_pattern, text)
+            docs = [p.strip() for p in parts if p and p.strip()]
+        else:
+            docs = [text]
+
+        if not docs:
+            raise DataLoadError("No text documents found after splitting.")
+
+        rows: list[dict[str, Any]] = []
+        for i, doc in enumerate(docs):
+            feats = DataLoader._text_document_features(doc)
+            feats["doc_id"] = i
+            rows.append(feats)
+
+        df = pd.DataFrame(rows).set_index("doc_id")
+        preview = "\n\n".join(docs)[:500_000]
+        return df, preview
+
+    @staticmethod
+    def simulate_audio_features(
+        *,
+        n_rows: int = 100,
+        seed: int | None = None,
+        name_hint: str = "",
+    ) -> pd.DataFrame:
+        """
+        Gerçek WAV ayrıştırması yerine tutarlı rastgele ‘ses özelliği’ tablosu üretir.
+
+        Dosya adı veya ``seed`` ile tekrarlanabilirlik; sütunlar kümeleme / PCA için
+        sayısal vektör olarak kullanılabilir.
+
+        Parameters
+        ----------
+        n_rows
+            Örnek (satır) sayısı.
+        seed
+            RNG tohumu; ``None`` ise ``name_hint`` karması kullanılır.
+        name_hint
+            Dosya adı gibi dize; tohum türetmek için.
+
+        Returns
+        -------
+        pd.DataFrame
+            ``freq_centroid_hz``, ``amplitude_rms``, ``tempo_bpm``,
+            ``zero_crossing_rate``, ``spectral_spread_sim`` sütunları.
+        """
+        n = max(5, min(5000, int(n_rows)))
+        if seed is None:
+            seed = abs(hash(name_hint)) % (2**31 - 1) if name_hint else 42
+        rng = np.random.default_rng(int(seed))
+        idx = pd.RangeIndex(start=0, stop=n, name="sample_id")
+        return pd.DataFrame(
+            {
+                "freq_centroid_hz": rng.uniform(120.0, 7800.0, n),
+                "amplitude_rms": rng.lognormal(mean=0.0, sigma=0.45, size=n),
+                "tempo_bpm": rng.uniform(62.0, 178.0, n),
+                "zero_crossing_rate": rng.uniform(0.02, 0.22, n),
+                "spectral_spread_sim": rng.uniform(0.15, 0.98, n),
+            },
+            index=idx,
+        )
+
+    @staticmethod
+    def simulate_image_features(
+        *,
+        n_rows: int = 100,
+        seed: int | None = None,
+        name_hint: str = "",
+    ) -> pd.DataFrame:
+        """
+        Görüntü koleksiyonunu taklit eden sayısal özellik tablosu (OpenCV/CNN yok).
+
+        Parlaklık, kontrast, renk doygunluğu, kenar yoğunluğu ve tahmini nesne sayısı
+        üretilir; gerçek piksellerden çıkarım yerine savunma ve boru hattı gösterimi
+        içindir (OpenCV veya evrişimli ağ ile değiştirilebilir).
+
+        Parameters
+        ----------
+        n_rows
+            Görüntü / örnek sayısı.
+        seed
+            RNG tohumu.
+        name_hint
+            Dosya adından türetilebilen tekrarlanabilirlik ipucu.
+
+        Returns
+        -------
+        pd.DataFrame
+            ``brightness``, ``contrast``, ``color_saturation``, ``edge_density``,
+            ``object_count``.
+        """
+        n = max(5, min(5000, int(n_rows)))
+        if seed is None:
+            seed = abs(hash(name_hint)) % (2**31 - 1) if name_hint else 43
+        rng = np.random.default_rng(int(seed))
+        idx = pd.RangeIndex(start=0, stop=n, name="image_id")
+        return pd.DataFrame(
+            {
+                "brightness": rng.uniform(0.08, 0.98, n),
+                "contrast": rng.uniform(0.12, 0.92, n),
+                "color_saturation": rng.uniform(0.0, 1.0, n),
+                "edge_density": rng.uniform(0.05, 0.95, n),
+                "object_count": rng.integers(1, 15, size=n).astype(np.float64),
+            },
+            index=idx,
+        )
 
     @staticmethod
     def infer_column_types(df: pd.DataFrame) -> tuple[list[str], list[str]]:

@@ -6,3 +6,4 @@ plotly
 scikit-learn
 matplotlib
 seaborn
+wordcloud
