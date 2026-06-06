@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.graph_objects import Figure
@@ -61,6 +62,245 @@ def cluster_color_discrete_map(labels: np.ndarray | pd.Series) -> dict[str, str]
 
 # Random Forest önem çubukları: küme paletiyle uyumlu tek renk (Küme 0 mavisi).
 _FEATURE_IMPORTANCE_BAR_COLOR: str = _CLUSTER_COLORS_BY_INDEX[0]
+
+# Düşük varyanslı / kategorik sütun eşiği (benzersiz oran veya mutlak adet).
+_LOW_VARIANCE_UNIQUE_RATIO: float = 0.08
+_LOW_VARIANCE_MAX_UNIQUE: int = 12
+
+SmartChartKind = Literal["scatter", "box", "bar"]
+
+
+def is_continuous_numeric(df: pd.DataFrame, column: str) -> bool:
+    """Sütunun sürekli sayısal (yüksek kardinalite) olduğunu heuristik olarak döner."""
+    if column not in df.columns:
+        return False
+    inferred_numeric, _ = DataLoader.infer_column_types(df)
+    if column not in inferred_numeric:
+        return False
+    s = pd.to_numeric(df[column], errors="coerce").dropna()
+    if len(s) < 3:
+        return False
+    n_unique = int(s.nunique())
+    n = int(len(s))
+    if n_unique <= _LOW_VARIANCE_MAX_UNIQUE:
+        ratio = n_unique / max(1, n)
+        if ratio <= _LOW_VARIANCE_UNIQUE_RATIO or n_unique <= 5:
+            return False
+    return True
+
+
+def is_categorical_or_low_variance(df: pd.DataFrame, column: str) -> bool:
+    """Kategorik veya düşük varyanslı (ayrık) sütun mu?"""
+    if column not in df.columns:
+        return False
+    inferred_numeric, categorical = DataLoader.infer_column_types(df)
+    if column in categorical:
+        return True
+    if column in inferred_numeric:
+        return not is_continuous_numeric(df, column)
+    return True
+
+
+def recommend_bivariate_chart(
+    df: pd.DataFrame,
+    col_a: str,
+    col_b: str,
+) -> tuple[SmartChartKind, str, str]:
+    """İki sütun için en uygun grafik türünü ve (grup, değer) eksen eşlemesini önerir.
+
+    Returns:
+        ``(chart_kind, x_or_group_col, y_or_value_col)``
+    """
+    if col_a == col_b:
+        raise ValueError("col_a and col_b must be different.")
+    cont_a = is_continuous_numeric(df, col_a)
+    cont_b = is_continuous_numeric(df, col_b)
+    if cont_a and cont_b:
+        return "scatter", col_a, col_b
+    if cont_a and not cont_b:
+        return "box", col_b, col_a
+    if not cont_a and cont_b:
+        return "box", col_a, col_b
+    return "bar", col_a, col_b
+
+
+def _pearson_strength_label(r: float) -> str:
+    """|r| büyüklüğüne göre Türkçe güç etiketi."""
+    a = abs(r)
+    if a >= 0.7:
+        strength = "güçlü"
+    elif a >= 0.4:
+        strength = "orta"
+    elif a >= 0.2:
+        strength = "zayıf"
+    else:
+        strength = "ihmal edilebilir"
+    direction = "pozitif" if r >= 0 else "negatif"
+    return f"{strength}/{direction}"
+
+
+class StatisticalCommentator:
+    """Grafik altı istatistiksel yorumları insan diline çevirir."""
+
+    @staticmethod
+    def scatter_pearson(df: pd.DataFrame, x_col: str, y_col: str) -> str:
+        sub = df[[x_col, y_col]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(sub) < 3:
+            return "Yeterli sayısal gözlem yok; korelasyon yorumu üretilemedi."
+        r = float(sub[x_col].corr(sub[y_col], method="pearson"))
+        if not np.isfinite(r):
+            return "Korelasyon hesaplanamadı (sabit veya eksik veri)."
+        pct = abs(r) * 100.0
+        label = _pearson_strength_label(r)
+        return (
+            f"**{x_col}** ile **{y_col}** arasında Pearson r = {r:.3f}; "
+            f"yaklaşık **%{pct:.0f}** oranında **{label}** bir ilişki tespit edildi."
+        )
+
+    @staticmethod
+    def boxplot_by_group(
+        df: pd.DataFrame,
+        value_col: str,
+        group_col: str,
+        *,
+        group_label: str = "grup",
+    ) -> str:
+        yvals = pd.to_numeric(df[value_col], errors="coerce")
+        groups = df[group_col].astype(str)
+        work = pd.DataFrame({"v": yvals, "g": groups}).dropna(subset=["v"])
+        if work.empty:
+            return "Kutu grafiği için yeterli sayısal veri yok."
+        med = work.groupby("g", sort=True)["v"].median()
+        means = work.groupby("g", sort=True)["v"].mean()
+        top_med = str(med.idxmax())
+        top_mean = str(means.idxmax())
+        spread = float(work["v"].max() - work["v"].min())
+        return (
+            f"Medyan değerlerine göre en yüksek dağılım **{top_med}** "
+            f"{group_label}inde toplanmıştır; ortalama en yüksek **{top_mean}** "
+            f"{group_label}indedir. **{value_col}** genel yayılımı ≈ {spread:.4g}."
+        )
+
+    @staticmethod
+    def bar_category_means(
+        df: pd.DataFrame,
+        category_col: str,
+        value_col: str,
+    ) -> str:
+        yvals = pd.to_numeric(df[value_col], errors="coerce")
+        cats = df[category_col].astype(str)
+        work = pd.DataFrame({"c": cats, "v": yvals}).dropna(subset=["v"])
+        if work.empty:
+            return "Çubuk grafiği için yeterli veri yok."
+        means = work.groupby("c", sort=True)["v"].mean()
+        top = str(means.idxmax())
+        bot = str(means.idxmin())
+        return (
+            f"**{category_col}** kırılımında **{value_col}** ortalaması en yüksek "
+            f"**{top}** kategorisinde, en düşük **{bot}** kategorisindedir."
+        )
+
+    @staticmethod
+    def correlation_heatmap(df: pd.DataFrame, numeric_columns: list[str]) -> str:
+        sub = df[numeric_columns].apply(pd.to_numeric, errors="coerce")
+        corr = sub.corr(numeric_only=True, method="pearson")
+        if corr.shape[0] < 2:
+            return "Korelasyon matrisi yorumu için yeterli sütun yok."
+        pairs: list[tuple[float, str, str]] = []
+        cols = list(corr.columns)
+        for i, a in enumerate(cols):
+            for b in cols[i + 1 :]:
+                r = float(corr.loc[a, b])
+                if np.isfinite(r):
+                    pairs.append((abs(r), a, b))
+        if not pairs:
+            return "Anlamlı korelasyon çifti bulunamadı."
+        pairs.sort(reverse=True)
+        _, a_max, b_max = pairs[0]
+        r_max = float(corr.loc[a_max, b_max])
+        return (
+            f"En güçlü doğrusal ilişki **{a_max}** – **{b_max}** arasında "
+            f"(Pearson r = {r_max:.3f}, {_pearson_strength_label(r_max)})."
+        )
+
+    @staticmethod
+    def feature_importance(
+        importance_df: pd.DataFrame,
+        *,
+        target_name: str | None = None,
+    ) -> str:
+        if importance_df.empty or importance_df.shape[1] < 2:
+            return "Özellik önemi tablosu boş."
+        feat_col = str(importance_df.columns[0])
+        imp_col = str(importance_df.columns[1])
+        top = importance_df.sort_values(imp_col, ascending=False).iloc[0]
+        feat = str(top[feat_col])
+        imp = float(top[imp_col])
+        ctx = (
+            f"**{target_name}** hedefini açıklamada"
+            if target_name
+            else "Ayırma / tahmin görevinde"
+        )
+        return (
+            f"{ctx} en etkili değişken **{feat}** "
+            f"(normalize önem ≈ {imp:.3f})."
+        )
+
+    @staticmethod
+    def elbow(elbow_df: pd.DataFrame, selected_k: int | None) -> str:
+        if elbow_df.empty or "inertia" not in elbow_df.columns:
+            return "Dirsek eğrisi yorumu için veri yok."
+        inert = elbow_df["inertia"].to_numpy(dtype=float)
+        ks = elbow_df["k"].to_numpy(dtype=int)
+        if len(inert) < 2:
+            return "Dirsek tespiti için en az iki k değeri gerekir."
+        drops = np.diff(inert)
+        rel = np.abs(drops[1:] / drops[:-1]) if len(drops) > 1 else np.array([1.0])
+        elbow_k = int(ks[1 + int(np.argmin(rel))]) if len(rel) else int(ks[0])
+        sk_txt = f" Seçilen k = {selected_k}." if selected_k else ""
+        return (
+            f"Inertia düşüşü k ≈ **{elbow_k}** civarında belirgin yavaşlıyor (dirsek "
+            f"sezgisel öneri).{sk_txt}"
+        )
+
+    @staticmethod
+    def silhouette(silhouette: float | None, n_clusters: int) -> str:
+        if silhouette is None:
+            return f"Silhouette k = {n_clusters} için hesaplanamadı veya tanımsız."
+        if silhouette > 0.5:
+            return (
+                f"Silhouette = {silhouette:.3f}: kümeler belirgin ve iyi ayrışmış "
+                "görünüyor."
+            )
+        if silhouette < 0.2:
+            return (
+                f"Silhouette = {silhouette:.3f}: kümeler iç içe; k veya özellik "
+                "seçimini gözden geçirin."
+            )
+        return f"Silhouette = {silhouette:.3f}: orta düzeyde küme ayrışması."
+
+    @staticmethod
+    def distribution(df: pd.DataFrame, column: str) -> str:
+        if column not in df.columns:
+            return "Dağılım yorumu için sütun bulunamadı."
+        s = df[column]
+        numeric_cols, _ = DataLoader.infer_column_types(df)
+        if column in numeric_cols or pd.api.types.is_numeric_dtype(s):
+            num = pd.to_numeric(s, errors="coerce").dropna()
+            if num.empty:
+                return "Sayısal dağılım için veri yok."
+            skew = float(stats.skew(num, nan_policy="omit"))
+            skew_txt = (
+                "sağa çarpık" if skew > 0.75 else "sola çarpık" if skew < -0.75 else "yaklaşık simetrik"
+            )
+            return (
+                f"**{column}** medyan = {float(num.median()):.4g}, "
+                f"IQR = {float(num.quantile(0.75) - num.quantile(0.25)):.4g}; "
+                f"dağılım {skew_txt} (çarpıklık ≈ {skew:.2f})."
+            )
+        vc = s.astype(str).value_counts().head(3)
+        top = ", ".join(f"{k} ({v})" for k, v in vc.items())
+        return f"**{column}** en sık kategoriler: {top}."
 
 
 class DataVisualizer:
@@ -194,6 +434,196 @@ class DataVisualizer:
                 yaxis_title=pc_y,
             )
         )
+        return fig
+
+    @staticmethod
+    def _resolve_pc3_columns(df_pca: pd.DataFrame) -> tuple[str, str, str]:
+        """Üç boyutlu PCA eksen adlarını çözer (``PC1``, ``PC2``, ``PC3`` öncelikli)."""
+        if df_pca.shape[1] < 3:
+            raise ValueError("df_pca must contain at least three coordinate columns.")
+        cols = list(df_pca.columns)
+        if all(f"PC{i}" in df_pca.columns for i in (1, 2, 3)):
+            return "PC1", "PC2", "PC3"
+        return str(cols[0]), str(cols[1]), str(cols[2])
+
+    def plot_3d_pca_clusters(
+        self,
+        df_pca: pd.DataFrame,
+        labels: np.ndarray | pd.Series,
+        *,
+        title: str | None = None,
+        variance_explained_pct: float | None = None,
+        chart_height: int = 640,
+    ) -> Figure:
+        """K-Means kümelerini PC1–PC3 uzayında ``px.scatter_3d`` ile gösterir.
+
+        Fareyle döndürülebilir 3B projeksiyon; küme sınırlarının derinlik algısı
+        ile incelenmesi için tasarlanmıştır.
+
+        Args:
+            df_pca: En az üç koordinat sütunu (tercihen ``PC1``…``PC3``).
+            labels: Satır ile hizalı küme etiketleri.
+            title: Özel başlık.
+            variance_explained_pct: İlk üç PC için açıklanan toplam varyans yüzdesi.
+            chart_height: Grafik yüksekliği (px).
+
+        Returns:
+            ``plotly.graph_objects.Figure`` (3D scatter).
+
+        Raises:
+            ValueError: Uzunluk uyumsuzluğu veya eksen çözülememesi.
+        """
+        if not isinstance(df_pca, pd.DataFrame):
+            raise ValueError("df_pca must be a pandas DataFrame.")
+        lab = np.asarray(labels)
+        if lab.shape[0] != len(df_pca):
+            raise ValueError(
+                f"labels length ({lab.shape[0]}) must match df_pca rows ({len(df_pca)})."
+            )
+
+        pc_x, pc_y, pc_z = self._resolve_pc3_columns(df_pca)
+        work = df_pca.copy()
+        work["_cluster"] = [_cluster_id_str(x) for x in lab]
+
+        cmap = cluster_color_discrete_map(lab)
+        fig = px.scatter_3d(
+            work,
+            x=pc_x,
+            y=pc_y,
+            z=pc_z,
+            color="_cluster",
+            color_discrete_map=cmap,
+            category_orders={
+                "_cluster": sorted(
+                    cmap.keys(),
+                    key=lambda s: int(s) if s.lstrip("-").isdigit() else 0,
+                )
+            },
+            labels={
+                pc_x: pc_x,
+                pc_y: pc_y,
+                pc_z: pc_z,
+                "_cluster": "Küme",
+            },
+            opacity=0.88,
+        )
+        fig.update_traces(marker=dict(size=4, line=dict(width=0.3, color="white")))
+        if title is None:
+            if variance_explained_pct is not None:
+                title = (
+                    "3D PCA Explorer — PC1+PC2+PC3 açıklanan varyans: "
+                    f"%{float(variance_explained_pct):.1f}"
+                )
+            else:
+                title = "3D PCA Explorer (K-Means kümeleri)"
+        fig.update_layout(
+            title={"text": title, "x": 0.5, "xanchor": "center"},
+            template=self._template,
+            height=int(chart_height),
+            margin=dict(l=0, r=0, t=80, b=0),
+            font=dict(family="system-ui, Segoe UI, sans-serif", size=13),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
+            ),
+            scene=dict(
+                xaxis_title=pc_x,
+                yaxis_title=pc_y,
+                zaxis_title=pc_z,
+            ),
+        )
+        return fig
+
+    def plot_timeseries_anomalies(
+        self,
+        df: pd.DataFrame,
+        time_col: str,
+        value_col: str,
+        anomaly_labels: np.ndarray | pd.Series,
+        *,
+        title: str | None = None,
+        chart_height: int = 520,
+    ) -> Figure:
+        """Zaman serisi çizgisi üzerinde Isolation Forest anomalilerini kırmızı sıçrama noktalarıyla işaretler.
+
+        Args:
+            df: Zaman ve değer sütunlarını içeren tablo.
+            time_col: Tarih/zaman ekseni sütunu.
+            value_col: İzlenecek sayısal metrik sütunu.
+            anomaly_labels: ``-1`` anomali, ``1`` normal (scikit-learn sözleşmesi).
+            title: Grafik başlığı.
+            chart_height: Piksel yüksekliği.
+
+        Returns:
+            Çizgi + anomali scatter ``Figure``.
+
+        Raises:
+            ValueError: Eksik sütun, uzunluk uyumsuzluğu veya boş seri.
+        """
+        if time_col not in df.columns or value_col not in df.columns:
+            raise ValueError("time_col and value_col must exist in DataFrame.")
+        preds = np.asarray(anomaly_labels).ravel()
+        if preds.shape[0] != len(df):
+            raise ValueError("anomaly_labels length must match df rows.")
+
+        times = pd.to_datetime(df[time_col], errors="coerce")
+        values = pd.to_numeric(df[value_col], errors="coerce")
+        work = pd.DataFrame(
+            {"_time": times, "_value": values, "_pred": preds},
+            index=df.index,
+        ).dropna(subset=["_time", "_value"])
+        if work.empty:
+            raise ValueError("No valid time-series points to plot.")
+        work = work.sort_values("_time")
+
+        normal = work["_pred"] != -1
+        anomaly = work["_pred"] == -1
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=work.loc[normal, "_time"],
+                y=work.loc[normal, "_value"],
+                mode="lines+markers",
+                name="Normal",
+                line=dict(color="#2563EB", width=1.5),
+                marker=dict(size=5, color="#2563EB", opacity=0.75),
+                hovertemplate="%{x}<br>%{y:.4f}<extra>Normal</extra>",
+            )
+        )
+        if anomaly.any():
+            fig.add_trace(
+                go.Scatter(
+                    x=work.loc[anomaly, "_time"],
+                    y=work.loc[anomaly, "_value"],
+                    mode="markers",
+                    name="Anomali (sıçrama)",
+                    marker=dict(
+                        color="#FF2D2D",
+                        size=14,
+                        symbol="diamond",
+                        line=dict(width=2, color="#FFFFFF"),
+                    ),
+                    hovertemplate="%{x}<br>%{y:.4f}<extra>Anomali (-1)</extra>",
+                )
+            )
+        ts_title = (
+            title
+            if title is not None
+            else f"Zaman serisi anomali motoru — {value_col}"
+        )
+        fig.update_layout(
+            **self._base_layout(
+                ts_title,
+                xaxis_title=str(time_col),
+                yaxis_title=str(value_col),
+                height=int(chart_height),
+            )
+        )
+        fig.update_xaxes(rangeslider_visible=True)
         return fig
 
     def plot_manual_cluster_scatter(
@@ -696,6 +1126,179 @@ class DataVisualizer:
             )
         )
         fig.update_layout(legend_title_text="Küme")
+        return fig
+
+    def plot_smart_scatter(
+        self,
+        df: pd.DataFrame,
+        x_col: str,
+        y_col: str,
+        *,
+        title: str | None = None,
+        color_col: str | None = None,
+    ) -> Figure:
+        """İki sürekli sayısal sütun için saçılım grafiği."""
+        work = df[[x_col, y_col]].apply(pd.to_numeric, errors="coerce").dropna()
+        if work.empty:
+            raise ValueError("No valid numeric pairs for scatter plot.")
+        fig = px.scatter(
+            work,
+            x=x_col,
+            y=y_col,
+            color=color_col if color_col and color_col in df.columns else None,
+            color_discrete_sequence=["#6366F1"],
+        )
+        fig.update_traces(marker=dict(size=9, opacity=0.82))
+        sc_title = title if title is not None else f"{x_col} vs {y_col} (saçılım)"
+        fig.update_layout(
+            **self._base_layout(sc_title, str(x_col), str(y_col))
+        )
+        return fig
+
+    def plot_smart_box(
+        self,
+        df: pd.DataFrame,
+        group_col: str,
+        value_col: str,
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """Kategorik / düşük varyanslı gruplara göre kutu grafiği."""
+        yvals = pd.to_numeric(df[value_col], errors="coerce")
+        groups = df[group_col].astype(str)
+        work = pd.DataFrame(
+            {str(value_col): yvals, "Grup": groups},
+            index=df.index,
+        ).dropna(subset=[str(value_col)])
+        if work.empty:
+            raise ValueError("No valid data for box plot.")
+        cat_order = sorted(work["Grup"].unique())
+        work["Grup"] = pd.Categorical(work["Grup"], categories=cat_order, ordered=True)
+        fig = px.box(
+            work,
+            x="Grup",
+            y=str(value_col),
+            color="Grup",
+            color_discrete_sequence=list(_CLUSTER_COLORS_BY_INDEX),
+            category_orders={"Grup": cat_order},
+        )
+        bx_title = (
+            title
+            if title is not None
+            else f"{value_col} — {group_col} kırılımında kutu grafik"
+        )
+        fig.update_layout(
+            **self._base_layout(
+                bx_title,
+                str(group_col),
+                str(value_col),
+            )
+        )
+        fig.update_layout(showlegend=False)
+        return fig
+
+    def plot_smart_bar(
+        self,
+        df: pd.DataFrame,
+        category_col: str,
+        value_col: str,
+        *,
+        title: str | None = None,
+    ) -> Figure:
+        """İki ayrık sütun için kategori başına ortalama çubuk grafiği."""
+        yvals = pd.to_numeric(df[value_col], errors="coerce")
+        cats = df[category_col].astype(str)
+        work = pd.DataFrame({"category": cats, "value": yvals}).dropna()
+        if work.empty:
+            raise ValueError("No valid data for bar chart.")
+        agg = work.groupby("category", sort=True)["value"].mean().reset_index()
+        fig = px.bar(
+            agg,
+            x="category",
+            y="value",
+            color_discrete_sequence=["#0EA5E9"],
+        )
+        br_title = (
+            title
+            if title is not None
+            else f"{value_col} ortalaması — {category_col} kırılımı"
+        )
+        fig.update_layout(
+            **self._base_layout(
+                br_title,
+                str(category_col),
+                f"Ort. {value_col}",
+            )
+        )
+        fig.update_xaxes(tickangle=-35)
+        return fig
+
+    def plot_smart_bivariate(
+        self,
+        df: pd.DataFrame,
+        col_a: str,
+        col_b: str,
+        *,
+        title: str | None = None,
+        labels: np.ndarray | pd.Series | None = None,
+    ) -> tuple[Figure, SmartChartKind, str]:
+        """Akıllı grafik seçici: sütun tiplerine göre scatter, box veya bar üretir.
+
+        Returns:
+            ``(figure, chart_kind, ai_comment)``
+        """
+        kind, group_col, value_col = recommend_bivariate_chart(df, col_a, col_b)
+        commentator = StatisticalCommentator()
+        if kind == "scatter":
+            fig = self.plot_smart_scatter(df, group_col, value_col, title=title)
+            comment = commentator.scatter_pearson(df, group_col, value_col)
+        elif kind == "box":
+            fig = self.plot_smart_box(df, group_col, value_col, title=title)
+            comment = commentator.boxplot_by_group(
+                df, value_col, group_col, group_label="kategoride"
+            )
+        else:
+            fig = self.plot_smart_bar(df, group_col, value_col, title=title)
+            comment = commentator.bar_category_means(df, group_col, value_col)
+        return fig, kind, comment
+
+    def plot_target_feature_importance(
+        self,
+        importance_df: pd.DataFrame,
+        *,
+        target_column: str,
+        title: str | None = None,
+        chart_height: int | None = None,
+    ) -> Figure:
+        """Hedef değişken odaklı Random Forest özellik önemi grafiği."""
+        if not isinstance(importance_df, pd.DataFrame) or importance_df.empty:
+            raise ValueError("importance_df must be a non-empty DataFrame.")
+        feat_col = str(importance_df.columns[0])
+        imp_col = str(importance_df.columns[1])
+        plot_df = importance_df.sort_values(imp_col, ascending=True)
+        fig = px.bar(
+            plot_df,
+            x=imp_col,
+            y=feat_col,
+            orientation="h",
+            color_discrete_sequence=[_FEATURE_IMPORTANCE_BAR_COLOR],
+        )
+        fig.update_traces(marker=dict(line=dict(width=0.5, color="white")))
+        h = int(chart_height) if chart_height is not None else 520
+        tgt_title = (
+            title
+            if title is not None
+            else f"Hedef: {target_column} — en etkili özellikler (Random Forest)"
+        )
+        fig.update_layout(
+            **self._base_layout(
+                tgt_title,
+                xaxis_title="Önem (normalize, toplam = 1)",
+                yaxis_title="Özellik",
+                height=h,
+            )
+        )
+        fig.update_layout(showlegend=False)
         return fig
 
     def plot_data_quality_radar(

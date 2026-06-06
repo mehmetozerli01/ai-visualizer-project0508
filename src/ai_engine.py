@@ -15,9 +15,9 @@ Matematiksel özeti
   binmeyen doğrusal bileşenlere ayrıştırılması (SVD tabanlı çözüm).
 * **Isolation Forest** — Rastgele ayrımlarla aykırıların daha kısa yoldan izole
   edildiği ansamble yöntem; ``contamination`` ön bilgisine bağlıdır.
-* **Random Forest (küme önemi)** — K-Means etiketleri sınıf kabul edilerek
-  ölçeklenmiş özelliklerde ayırma önemleri (``feature_importances_``); keşifsel
-  yorum içindir, nedensel kanıt değildir.
+* **Random Forest (küme / hedef önemi)** — K-Means etiketleri veya kullanıcı
+  hedef değişkeni üzerinde ölçeklenmiş özelliklerde ``feature_importances_``;
+  keşifsel yorum içindir, nedensel kanıt değildir.
 """
 
 from __future__ import annotations
@@ -28,7 +28,11 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.ensemble import (
+    IsolationForest,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
@@ -328,6 +332,116 @@ class AIEngine:
 
         return out
 
+    def target_feature_importance_rf(
+        self,
+        df: pd.DataFrame,
+        target_column: str,
+        numeric_columns: list[str] | None = None,
+        *,
+        n_estimators: int = 200,
+    ) -> pd.DataFrame:
+        """Seçilen hedef değişkeni tahmin eden **Random Forest** özellik önemleri.
+
+        Hedef sürekli sayısal ise ``RandomForestRegressor``; aksi halde sınıflandırıcı
+        kullanılır. Hedef sütun özellik matrisinden çıkarılır; kalan sayısal sütunlar
+        açıklayıcı değişken kabul edilir.
+
+        Args:
+            df: Model girdi çerçevesi.
+            target_column: Açıklanacak hedef sütun adı.
+            numeric_columns: Modele girebilecek sayısal sütunlar (hedef hariç tutulur).
+            n_estimators: Orman ağacı sayısı.
+
+        Returns:
+            ``feature``, ``importance`` sütunları; normalize, azalan sıra.
+
+        Raises:
+            AIModelError: Hedef yok, yeterli özellik yok veya eğitim hatası.
+        """
+        if not target_column or target_column not in df.columns:
+            raise AIModelError(
+                f"Hedef sütun bulunamadı: {target_column!r}"
+            )
+
+        inferred_numeric, _ = DataLoader.infer_column_types(df)
+        if numeric_columns is not None:
+            feat_pool = [c for c in numeric_columns if c != target_column]
+        else:
+            feat_pool = [c for c in inferred_numeric if c != target_column]
+
+        if len(feat_pool) < 1:
+            raise AIModelError(
+                "Hedef dışında en az bir sayısal açıklayıcı sütun gerekir."
+            )
+
+        try:
+            y_raw = df[target_column]
+            if DataLoader._is_numeric_feature_column(y_raw):
+                y = pd.to_numeric(y_raw, errors="coerce")
+                is_regression = True
+                if y.nunique(dropna=True) <= 10:
+                    is_regression = False
+            else:
+                y = y_raw.astype(str)
+                is_regression = False
+
+            work = df[feat_pool].apply(pd.to_numeric, errors="coerce")
+            col_means = work.mean()
+            work = work.fillna(col_means).fillna(0.0)
+            y = y.reindex(work.index)
+            mask = y.notna() & work.notna().all(axis=1)
+            X = np.asarray(work.loc[mask], dtype=np.float64)
+            y_fit = y.loc[mask]
+            if int(X.shape[0]) < 4:
+                raise AIModelError(
+                    "Hedef önemi için yeterli tam gözlem yok (en az 4 satır)."
+                )
+
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+            n_feat = int(X_scaled.shape[1])
+            max_depth = min(16, max(3, n_feat * 2))
+
+            if is_regression:
+                model: RandomForestRegressor | RandomForestClassifier = (
+                    RandomForestRegressor(
+                        n_estimators=int(n_estimators),
+                        random_state=self._random_state,
+                        max_depth=max_depth,
+                    )
+                )
+                y_train = np.asarray(y_fit, dtype=np.float64)
+            else:
+                model = RandomForestClassifier(
+                    n_estimators=int(n_estimators),
+                    random_state=self._random_state,
+                    max_depth=max_depth,
+                    class_weight="balanced_subsample",
+                )
+                y_train = np.asarray(y_fit)
+
+            if len(np.unique(y_train)) < 2:
+                raise AIModelError(
+                    "Hedef değişkende en az iki farklı değer gerekir."
+                )
+
+            model.fit(X_scaled, y_train)
+            imp = np.asarray(model.feature_importances_, dtype=np.float64)
+            s = float(np.sum(imp))
+            if s > 0:
+                imp = imp / s
+            out = pd.DataFrame(
+                {"feature": feat_pool, "importance": imp}
+            ).sort_values("importance", ascending=False, ignore_index=True)
+        except AIModelError:
+            raise
+        except Exception as exc:
+            raise AIModelError(
+                f"Hedef değişken önem analizi başarısız: {exc}"
+            ) from exc
+
+        return out
+
     def perform_pca(
         self,
         df: pd.DataFrame,
@@ -443,3 +557,137 @@ class AIEngine:
             raise AIModelError(f"Anomaly detection failed: {exc}") from exc
 
         return np.asarray(predictions, dtype=np.int8)
+
+    def fit_deployable_models(
+        self,
+        df: pd.DataFrame,
+        *,
+        n_clusters: int,
+        contamination: float,
+        numeric_columns: list[str],
+        target_column: str,
+        n_estimators: int = 200,
+    ) -> dict[str, Any]:
+        """Canlı ortama aktarım için K-Means, Isolation Forest ve Random Forest eğitir.
+
+        Tüm modeller aynı özellik uzayında tutarlı ön işlemle eğitilir; dönen
+        sözlükte ``scaler``, ``target_scaler`` ve metadata bulunur.
+
+        Args:
+            df: Model girdi çerçevesi.
+            n_clusters: K-Means küme sayısı.
+            contamination: Isolation Forest contamination.
+            numeric_columns: Sayısal özellik listesi.
+            target_column: Hedef değişken (Random Forest).
+            n_estimators: Random Forest ağaç sayısı.
+
+        Returns:
+            ``kmeans``, ``isolation_forest``, ``random_forest``, ``scaler``,
+            ``target_scaler``, ``feature_columns``, ``target_feature_columns``,
+            ``target_column``, ``rf_task`` anahtarları.
+
+        Raises:
+            AIModelError: Hazırlık veya eğitim hatası.
+        """
+        if n_clusters < 1:
+            raise AIModelError("n_clusters must be at least 1.")
+        if contamination <= 0.0 or contamination > 0.5:
+            raise AIModelError("contamination must be in (0.0, 0.5].")
+
+        try:
+            X, use_cols = self._prepare_data(df, numeric_columns=numeric_columns)
+            n_samples = int(X.shape[0])
+            if n_clusters >= n_samples:
+                raise AIModelError(
+                    f"Satır sayısı ({n_samples}) küme sayısından ({n_clusters}) büyük olmalı."
+                )
+            if n_samples < 2:
+                raise AIModelError("En az 2 satır gerekir.")
+
+            frame = df[use_cols].apply(pd.to_numeric, errors="coerce")
+            col_means = frame.mean()
+            frame = frame.fillna(col_means).fillna(0.0)
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(np.asarray(frame, dtype=np.float64))
+
+            kmeans = KMeans(
+                n_clusters=n_clusters,
+                random_state=self._random_state,
+                n_init=10,
+            )
+            kmeans.fit(X_scaled)
+
+            iso = IsolationForest(
+                contamination=contamination,
+                random_state=self._random_state,
+            )
+            iso.fit(X_scaled)
+
+            rf_model: RandomForestRegressor | RandomForestClassifier | None = None
+            target_scaler: StandardScaler | None = None
+            target_feat_cols: list[str] = []
+            rf_task = "none"
+
+            if target_column and target_column in df.columns:
+                feat_pool = [c for c in use_cols if c != target_column]
+                if feat_pool:
+                    y_raw = df[target_column]
+                    if DataLoader._is_numeric_feature_column(y_raw):
+                        y = pd.to_numeric(y_raw, errors="coerce")
+                        is_regression = y.nunique(dropna=True) > 10
+                    else:
+                        y = y_raw.astype(str)
+                        is_regression = False
+
+                    t_frame = df[feat_pool].apply(pd.to_numeric, errors="coerce")
+                    t_means = t_frame.mean()
+                    t_frame = t_frame.fillna(t_means).fillna(0.0)
+                    y = y.reindex(t_frame.index)
+                    mask = y.notna() & t_frame.notna().all(axis=1)
+                    X_t = np.asarray(t_frame.loc[mask], dtype=np.float64)
+                    y_fit = y.loc[mask]
+                    if int(X_t.shape[0]) >= 4 and len(np.unique(y_fit)) >= 2:
+                        target_scaler = StandardScaler()
+                        X_t_scaled = target_scaler.fit_transform(X_t)
+                        n_feat = int(X_t_scaled.shape[1])
+                        max_depth = min(16, max(3, n_feat * 2))
+                        if is_regression:
+                            rf_model = RandomForestRegressor(
+                                n_estimators=int(n_estimators),
+                                random_state=self._random_state,
+                                max_depth=max_depth,
+                            )
+                            rf_model.fit(
+                                X_t_scaled,
+                                np.asarray(y_fit, dtype=np.float64),
+                            )
+                            rf_task = "regression"
+                        else:
+                            rf_model = RandomForestClassifier(
+                                n_estimators=int(n_estimators),
+                                random_state=self._random_state,
+                                max_depth=max_depth,
+                                class_weight="balanced_subsample",
+                            )
+                            rf_model.fit(X_t_scaled, np.asarray(y_fit))
+                            rf_task = "classification"
+                        target_feat_cols = list(feat_pool)
+
+            return {
+                "kmeans": kmeans,
+                "isolation_forest": iso,
+                "random_forest": rf_model,
+                "scaler": scaler,
+                "target_scaler": target_scaler,
+                "feature_columns": list(use_cols),
+                "target_feature_columns": target_feat_cols,
+                "target_column": str(target_column),
+                "rf_task": rf_task,
+                "n_clusters": int(n_clusters),
+                "contamination": float(contamination),
+                "random_state": int(self._random_state),
+            }
+        except AIModelError:
+            raise
+        except Exception as exc:
+            raise AIModelError(f"Deployable model training failed: {exc}") from exc

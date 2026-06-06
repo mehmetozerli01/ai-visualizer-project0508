@@ -13,8 +13,12 @@ matematiksel modeller :mod:`ai_engine` içindedir.
 
 from __future__ import annotations
 
+import json
+import zipfile
+from io import BytesIO
 from typing import Any, Literal
 
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -22,17 +26,18 @@ import streamlit as st
 from ai_engine import AIEngine
 from exceptions import AIModelError, DataLoadError, PreprocessingError
 from processor import DataLoader
-from visualizer import DataVisualizer
+from visualizer import DataVisualizer, StatisticalCommentator
 
 # --- Merkezi ayarlar (bakım / tema / varsayılanlar) -----------------------------
 CONFIG: dict[str, Any] = {
-    "VERSION": "0.7.0",
+    "VERSION": "1.0.0",
     "UI": {
         "PAGE_TITLE": "AI Visualizer",
         "PAGE_LAYOUT": "wide",
-        "APP_TITLE": "AI Visualizer — geliştirme paneli",
+        "APP_TITLE": "AI Visualizer — Başyapıt v1.0.0",
         "APP_CAPTION": (
-            "CSV / Excel yükleme, özet, temizleme, AI analizleri ve Plotly grafikleri."
+            "Kurumsal veri platformu: çok sayfalı Excel, model serileştirme, "
+            "What-If analiz ve premium görselleştirme."
         ),
         "FILE_UPLOADER_LABEL": "CSV / Excel dosyası",
         "FILE_EXTENSIONS": ["csv", "xlsx", "xlsm"],
@@ -40,11 +45,18 @@ CONFIG: dict[str, Any] = {
         "INFO_NO_FILE": "Başlamak için sol menüden bir veri dosyası seçin veya örnek veriyi yükleyin.",
         "BTN_DEMO_DATA": "Örnek veriyi yükle",
         "BTN_DEMO_HELP": (
-            "Iris / Wine (sklearn) veya sentetik anomali demosu; dosya seçmeden yüklenir."
+            "Iris, Wine, Kaliforniya ev fiyatları, Diyabet (sklearn) veya sentetik anomali; "
+            "dosya seçmeden yüklenir."
         ),
         "DEMO_LABEL": "Örnek veri seti",
         "SUCCESS_DEMO": "Örnek veri yüklendi: **{dataset}**.",
         "BTN_DOWNLOAD_REPORT": "Akademik analiz raporunu indir",
+        "BTN_DOWNLOAD_CODE": "💻 Analiz Kodunu İndir (.py)",
+        "BTN_DOWNLOAD_EXCEL": "📊 Temizlenmiş Veriyi İndir (.xlsx)",
+        "BTN_DOWNLOAD_MODELS": "🧠 Eğitilmiş Modelleri İndir (.zip)",
+        "CODE_FILENAME_PREFIX": "ai_visualizer_reproducible_analysis",
+        "EXCEL_FILENAME_PREFIX": "ai_visualizer_cleaned_export",
+        "MODELS_ZIP_PREFIX": "ai_visualizer_trained_models",
         "REPORT_FILENAME_PREFIX": "akademik_analiz_raporu",
         "APP_TITLE_ICON": "◆",
         "TAB_ICONS": ["📋", "📑", "✨", "🧪", "🎯"],
@@ -63,7 +75,7 @@ CONFIG: dict[str, Any] = {
         "REPORT_PREVIEW_EXPANDER": "📄 İndirilecek rapor önizlemesi",
         "REPORT_STRATEGY_SECTION_MD": "## 🤖 AI Stratejik Tavsiyeler",
         "FOOTER_TEXT": (
-            "v0.7.0 | Mehmet Özerli — Vizyoner özellikler (görüntü simülatörü, kalite radarı, strateji motoru)"
+            "v1.0.0 RC | Mehmet Özerli — Kurumsal platform (Excel export, model ZIP, premium UI)"
         ),
         "DATA_MODE_LABEL": "Veri Türü Seçin",
         "DATA_MODES": {
@@ -88,6 +100,7 @@ CONFIG: dict[str, Any] = {
         "CONTAMINATION_MAX": 0.5,
         "CONTAMINATION_STEP": 0.01,
         "PCA_COMPONENTS_UI": 2,
+        "PCA_COMPONENTS_3D": 3,
         "MIN_NUMERIC_FEATURES": 2,
     },
     "PREVIEW": {
@@ -147,8 +160,12 @@ CONFIG: dict[str, Any] = {
             "log dönüşümü veya segmentasyon düşünün."
         ),
         "rf_importance": (
-            "Bu grafik, gözetimsiz (unsupervised) kümelerin hangi gözetimli (supervised) "
-            "özelliklerle en iyi açıklandığını gösterir."
+            "Bu grafik, seçilen hedef değişkeni tahmin etmek için hangi sütunların "
+            "en yüksek marjinal katkıyı verdiğini gösterir (Random Forest)."
+        ),
+        "smart_chart": (
+            "Akıllı seçici: iki sürekli sayısal sütunda saçılım; biri kategorik/düşük "
+            "varyanslıysa kutu veya çubuk grafiği otomatik seçilir."
         ),
         "anomaly_character": (
             "Bu tablo, aykırı değerlerin normal veriden hangi istatistiksel sapmalarla "
@@ -165,6 +182,9 @@ CONFIG: dict[str, Any] = {
         "FILE_UPLOADER": "wv_dataset_upload",
         "FEATURE_DIST_COLUMN": "feature_dist_column",
         "DEMO_SAMPLE": "wv_demo_sample",
+        "TARGET_VARIABLE": "wv_target_variable",
+        "TIME_COLUMN": "wv_time_column",
+        "TS_VALUE_COLUMN": "wv_ts_value_column",
         "DATA_MODE": "wv_data_mode",
         "TEXT_CORPUS_BLOB": "_wv_text_corpus_display",
     },
@@ -222,8 +242,30 @@ CONFIG: dict[str, Any] = {
 _DEMO_DATASET_LABELS: dict[str, str] = {
     "iris": "Iris (botanik)",
     "wine": "Wine (şarap kalitesi)",
+    "california_housing": "Kaliforniya Ev Fiyatları (regresyon)",
+    "diabetes": "Diyabet (regresyon)",
     "anomaly_synthetic": "Anomali Test Seti (Sentetik)",
 }
+
+_TARGET_COLUMN_HINTS: tuple[str, ...] = (
+    "target",
+    "medhouseval",
+    "price",
+    "label",
+    "y",
+)
+
+_DATETIME_NAME_HINTS: tuple[str, ...] = (
+    "date",
+    "time",
+    "timestamp",
+    "datetime",
+    "tarih",
+    "zaman",
+    "created",
+    "logged",
+    "recorded",
+)
 
 _DATA_MODE_ORDER: tuple[str, ...] = (
     "tabular",
@@ -320,6 +362,456 @@ def _academic_tip_if(enabled: bool, text: str) -> None:
         st.success(text.strip())
 
 
+def _render_ai_comment(text: str) -> None:
+    """Grafik altı istatistiksel yorum (AI Commentator)."""
+    if text and str(text).strip():
+        st.info(f"🤖 **AI Yorumu:** {text.strip()}")
+
+
+def _default_target_column_index(columns: list[str]) -> int:
+    """Hedef değişken için varsayılan selectbox indeksi."""
+    lower_map = {str(c).lower(): i for i, c in enumerate(columns)}
+    for hint in _TARGET_COLUMN_HINTS:
+        if hint in lower_map:
+            return int(lower_map[hint])
+    return max(0, len(columns) - 1)
+
+
+def _apply_row_filters(
+    df: pd.DataFrame,
+    *,
+    cat_filters: dict[str, list[str]],
+    numeric_ranges: dict[str, tuple[float, float]],
+) -> pd.DataFrame:
+    """Kategorik çoklu seçim ve sayısal aralık filtrelerini satır bazında uygular."""
+    out = df
+    for col, selected in cat_filters.items():
+        if not selected or col not in out.columns:
+            continue
+        allowed = {str(v) for v in selected}
+        mask = out[col].astype(str).isin(allowed)
+        out = out.loc[mask]
+    for col, bounds in numeric_ranges.items():
+        if col not in out.columns:
+            continue
+        lo, hi = bounds
+        s = pd.to_numeric(out[col], errors="coerce")
+        out = out.loc[s.between(lo, hi, inclusive="both")]
+    return out
+
+
+def _whatif_session_key(upload_fingerprint: str) -> str:
+    """What-If düzenleyici için oturum anahtarı."""
+    return f"whatif_df_{upload_fingerprint}"
+
+
+def _dataframe_edit_fingerprint(df: pd.DataFrame) -> str:
+    """``st.data_editor`` değişikliklerini güvenilir şekilde izlemek için özet."""
+    try:
+        h = pd.util.hash_pandas_object(df, index=True).sum()
+        return f"{len(df)}:{int(h)}"
+    except Exception:
+        return f"{len(df)}:{df.shape[1]}:{df.columns.tolist()}"
+
+
+def _detect_datetime_columns(df: pd.DataFrame) -> list[str]:
+    """Tarih/zaman sütunlarını dtype veya parse başarı oranıyla tespit eder."""
+    if df.empty:
+        return []
+    found: list[str] = []
+    for col in df.columns:
+        series = df[col]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            found.append(str(col))
+            continue
+        col_l = str(col).lower()
+        name_hit = any(h in col_l for h in _DATETIME_NAME_HINTS)
+        parsed = pd.to_datetime(series, errors="coerce")
+        ratio = float(parsed.notna().mean()) if len(series) else 0.0
+        if ratio >= 0.85 and (name_hit or ratio >= 0.95):
+            found.append(str(col))
+    return list(dict.fromkeys(found))
+
+
+def _run_analysis_pipeline(
+    analysis_df: pd.DataFrame,
+    *,
+    n_clusters: int,
+    contamination: float,
+    elbow_k_max: int,
+    selected_numeric: list[str],
+    target_variable: str,
+    pca_components_2d: int,
+    pca_components_3d: int,
+) -> dict[str, Any]:
+    """K-Means, PCA (2D+3D), anomali, dirsek ve RF önemlerini tek çağrıda çalıştırır."""
+    labels: pd.Series | None = None
+    pca_coords: pd.DataFrame | None = None
+    pca_coords_3d: pd.DataFrame | None = None
+    pred: pd.Series | None = None
+    err_cluster: str | None = None
+    err_pca: str | None = None
+    err_pca_3d: str | None = None
+    err_anomaly: str | None = None
+    inertia_val: float | None = None
+    silhouette_val: float | None = None
+    pca_variance_pct: float | None = None
+    pca_variance_pct_3d: float | None = None
+    elbow_df: pd.DataFrame | None = None
+    err_elbow: str | None = None
+    cluster_imp_df: pd.DataFrame | None = None
+    err_importance: str | None = None
+    target_imp_df: pd.DataFrame | None = None
+    err_target_importance: str | None = None
+
+    engine = AIEngine()
+    cols_arg = selected_numeric
+
+    try:
+        raw_labels, inertia_val, silhouette_val = engine.perform_clustering(
+            analysis_df,
+            n_clusters,
+            numeric_columns=cols_arg,
+        )
+        labels = pd.Series(raw_labels, index=analysis_df.index)
+    except AIModelError as exc:
+        err_cluster = str(exc)
+        inertia_val = None
+        silhouette_val = None
+
+    try:
+        pca_coords, pca_var_info = engine.perform_pca(
+            analysis_df,
+            n_components=int(pca_components_2d),
+            numeric_columns=cols_arg,
+        )
+        pca_variance_pct = float(pca_var_info["variance_explained_pct"])
+    except AIModelError as exc:
+        err_pca = str(exc)
+        pca_variance_pct = None
+
+    try:
+        pca_coords_3d, pca_var_3d = engine.perform_pca(
+            analysis_df,
+            n_components=int(pca_components_3d),
+            numeric_columns=cols_arg,
+        )
+        pca_variance_pct_3d = float(pca_var_3d["variance_explained_pct"])
+    except AIModelError as exc:
+        err_pca_3d = str(exc)
+        pca_variance_pct_3d = None
+
+    try:
+        raw_pred = engine.detect_anomalies(
+            analysis_df,
+            contamination=contamination,
+            numeric_columns=cols_arg,
+        )
+        pred = pd.Series(raw_pred, index=analysis_df.index)
+    except AIModelError as exc:
+        err_anomaly = str(exc)
+
+    try:
+        elbow_df = engine.elbow_inertia_scan(
+            analysis_df,
+            k_max=elbow_k_max,
+            numeric_columns=cols_arg,
+        )
+    except AIModelError as exc:
+        err_elbow = str(exc)
+        elbow_df = None
+
+    if err_cluster is None and labels is not None:
+        try:
+            if len(np.unique(labels.to_numpy())) >= 2:
+                cluster_imp_df = engine.cluster_feature_importance_rf(
+                    analysis_df,
+                    labels.to_numpy(),
+                    numeric_columns=cols_arg,
+                )
+        except AIModelError as exc:
+            err_importance = str(exc)
+
+    if target_variable and target_variable in analysis_df.columns:
+        try:
+            target_imp_df = engine.target_feature_importance_rf(
+                analysis_df,
+                target_variable,
+                numeric_columns=cols_arg,
+            )
+        except AIModelError as exc:
+            err_target_importance = str(exc)
+
+    models_zip_bytes: bytes | None = None
+    err_models_zip: str | None = None
+    try:
+        bundle = engine.fit_deployable_models(
+            analysis_df,
+            n_clusters=int(n_clusters),
+            contamination=float(contamination),
+            numeric_columns=cols_arg,
+            target_column=str(target_variable),
+        )
+        models_zip_bytes = _build_models_zip_bytes(bundle, app_version=CONFIG["VERSION"])
+    except AIModelError as exc:
+        err_models_zip = str(exc)
+
+    return {
+        "labels": labels,
+        "pca_coords": pca_coords,
+        "pca_coords_3d": pca_coords_3d,
+        "pred": pred,
+        "err_cluster": err_cluster,
+        "err_pca": err_pca,
+        "err_pca_3d": err_pca_3d,
+        "err_anomaly": err_anomaly,
+        "n_clusters": n_clusters,
+        "inertia": inertia_val,
+        "silhouette": silhouette_val,
+        "pca_variance_pct": pca_variance_pct,
+        "pca_variance_pct_3d": pca_variance_pct_3d,
+        "elbow_df": elbow_df,
+        "err_elbow": err_elbow,
+        "feature_columns": list(selected_numeric),
+        "cluster_importance_df": cluster_imp_df,
+        "err_importance": err_importance,
+        "target_column": str(target_variable),
+        "target_importance_df": target_imp_df,
+        "err_target_importance": err_target_importance,
+        "models_zip_bytes": models_zip_bytes,
+        "err_models_zip": err_models_zip,
+    }
+
+
+def _build_multi_sheet_excel_bytes(
+    analysis_base: pd.DataFrame,
+    result: dict[str, Any],
+) -> bytes:
+    """3 sekmeli Excel: Cleaned Data, Anomalies, Summary (describe)."""
+    buf = BytesIO()
+    cleaned = analysis_base.copy()
+    labels = result.get("labels")
+    pred = result.get("pred")
+    if labels is not None:
+        cleaned.insert(0, "Cluster_ID", np.asarray(labels).ravel())
+    if pred is not None:
+        cleaned["Anomaly_Label"] = np.asarray(pred).ravel()
+
+    numeric_cols, _ = DataLoader.infer_column_types(analysis_base)
+    if numeric_cols:
+        summary = (
+            analysis_base[numeric_cols]
+            .apply(pd.to_numeric, errors="coerce")
+            .describe()
+            .T
+        )
+    else:
+        summary = pd.DataFrame({"note": ["Sayısal sütun yok"]})
+
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        cleaned.to_excel(writer, sheet_name="Cleaned Data", index=False)
+        if pred is not None:
+            pred_s = pd.Series(np.asarray(pred).ravel(), index=analysis_base.index)
+            anomalies = cleaned.loc[pred_s == -1]
+        else:
+            anomalies = cleaned.head(0)
+        anomalies.to_excel(writer, sheet_name="Anomalies", index=False)
+        summary.to_excel(writer, sheet_name="Summary", index=True)
+    return buf.getvalue()
+
+
+def _build_models_zip_bytes(
+    bundle: dict[str, Any],
+    *,
+    app_version: str,
+) -> bytes:
+    """joblib ile eğitilmiş modelleri metadata ile ZIP arşivine paketler."""
+    meta = {
+        "app_version": app_version,
+        "feature_columns": bundle.get("feature_columns", []),
+        "target_feature_columns": bundle.get("target_feature_columns", []),
+        "target_column": bundle.get("target_column"),
+        "rf_task": bundle.get("rf_task"),
+        "n_clusters": bundle.get("n_clusters"),
+        "contamination": bundle.get("contamination"),
+        "random_state": bundle.get("random_state"),
+        "load_hint": (
+            "joblib.load('kmeans.pkl'); aynı scaler ile ölçeklenmiş özellikler "
+            "gönderin."
+        ),
+    }
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("metadata.json", json.dumps(meta, indent=2, ensure_ascii=False))
+        zf.writestr("README.txt", (
+            "AI Visualizer — eğitilmiş model paketi\n"
+            f"Sürüm: {app_version}\n\n"
+            "Canlı ortamda: joblib.load + metadata.json sütun listesi ile kullanın.\n"
+        ))
+
+        def _add_pkl(name: str, obj: Any) -> None:
+            blob = BytesIO()
+            joblib.dump(obj, blob)
+            zf.writestr(name, blob.getvalue())
+
+        _add_pkl("kmeans.pkl", bundle["kmeans"])
+        _add_pkl("isolation_forest.pkl", bundle["isolation_forest"])
+        _add_pkl("standard_scaler.pkl", bundle["scaler"])
+        rf = bundle.get("random_forest")
+        if rf is not None:
+            _add_pkl("random_forest.pkl", rf)
+        t_scaler = bundle.get("target_scaler")
+        if t_scaler is not None:
+            _add_pkl("target_scaler.pkl", t_scaler)
+    return buf.getvalue()
+
+
+def _build_reproducible_analysis_script(
+    *,
+    feature_columns: list[str],
+    target_column: str,
+    n_clusters: int,
+    contamination: float,
+    elbow_k_max: int,
+    use_log_transform: bool,
+    app_version: str,
+    time_column: str | None = None,
+    ts_value_column: str | None = None,
+) -> str:
+    """Panel ayarlarından yerel ortamda tekrarlanabilir sklearn/pandas betiği üretir."""
+    cols_repr = repr(list(feature_columns))
+    log_block = ""
+    if use_log_transform:
+        log_block = (
+            "for _c in FEATURE_COLUMNS:\n"
+            "    s = pd.to_numeric(work[_c], errors='coerce')\n"
+            "    if s.dropna().empty or float(s.min()) < 0:\n"
+            "        continue\n"
+            "    work[_c] = np.log1p(s.clip(lower=0.0))\n"
+        )
+    ts_block = ""
+    if time_column and ts_value_column:
+        ts_block = (
+            f"\n# Zaman serisi modu\n"
+            f"TIME_COL = {time_column!r}\n"
+            f"TS_VALUE_COL = {ts_value_column!r}\n"
+            f"work[TIME_COL] = pd.to_datetime(work[TIME_COL], errors='coerce')\n"
+            f"work = work.sort_values(TIME_COL)\n"
+        )
+    return f'''#!/usr/bin/env python3
+"""
+AI Visualizer v{app_version} — yeniden üretilebilir analiz betiği.
+Bu dosya uygulama panelindeki ayarlardan otomatik üretilmiştir (kara kutu değildir).
+Gereksinimler: pandas, numpy, scikit-learn
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest, RandomForestRegressor, RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+
+# --- Kullanıcı: veri yolunu güncelleyin ---
+DATA_PATH = "veri_setiniz.csv"  # veya .xlsx
+
+FEATURE_COLUMNS = {cols_repr}
+TARGET_COLUMN = {target_column!r}
+N_CLUSTERS = {int(n_clusters)}
+CONTAMINATION = {float(contamination)}
+ELBOW_K_MAX = {int(elbow_k_max)}
+USE_LOG_TRANSFORM = {bool(use_log_transform)}
+RANDOM_STATE = 42
+{ts_block}
+
+def load_data(path: str) -> pd.DataFrame:
+    if path.lower().endswith((".xlsx", ".xlsm")):
+        return pd.read_excel(path, engine="openpyxl")
+    return pd.read_csv(path)
+
+
+def prepare_matrix(df: pd.DataFrame, columns: list[str]) -> tuple[np.ndarray, pd.DataFrame]:
+    frame = df[columns].apply(pd.to_numeric, errors="coerce")
+    frame = frame.fillna(frame.mean()).fillna(0.0)
+    scaler = StandardScaler()
+    return scaler.fit_transform(frame.to_numpy(dtype=float)), frame
+
+
+def main() -> None:
+    raw = load_data(DATA_PATH)
+    work = raw.copy()
+    {log_block}
+    X, frame = prepare_matrix(work, FEATURE_COLUMNS)
+
+    # K-Means
+    km = KMeans(n_clusters=N_CLUSTERS, random_state=RANDOM_STATE, n_init=10)
+    labels = km.fit_predict(X)
+    print("K-Means inertia:", float(km.inertia_))
+    work["cluster"] = labels
+
+    # PCA (2D + 3D)
+    pca2 = PCA(n_components=2, random_state=RANDOM_STATE)
+    coords2 = pca2.fit_transform(X)
+    print("PCA PC1+PC2 varyans %:", float(pca2.explained_variance_ratio_.sum() * 100))
+    pca3 = PCA(n_components=3, random_state=RANDOM_STATE)
+    coords3 = pca3.fit_transform(X)
+    print("PCA PC1+PC2+PC3 varyans %:", float(pca3.explained_variance_ratio_.sum() * 100))
+
+    # Isolation Forest
+    iso = IsolationForest(contamination=CONTAMINATION, random_state=RANDOM_STATE)
+    work["anomaly_label"] = iso.fit_predict(X)
+    n_anom = int((work["anomaly_label"] == -1).sum())
+    print(f"Anomali sayısı (-1): {{n_anom}}")
+
+    # Hedef değişken — Random Forest önemi
+    feat_for_target = [c for c in FEATURE_COLUMNS if c != TARGET_COLUMN]
+    if TARGET_COLUMN in work.columns and feat_for_target:
+        X_t, _ = prepare_matrix(work, feat_for_target)
+        y_raw = pd.to_numeric(work[TARGET_COLUMN], errors="coerce")
+        if y_raw.nunique(dropna=True) > 10:
+            rf = RandomForestRegressor(n_estimators=200, random_state=RANDOM_STATE)
+            rf.fit(X_t, y_raw.fillna(y_raw.mean()))
+        else:
+            rf = RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE)
+            rf.fit(X_t, work[TARGET_COLUMN].astype(str))
+        imp = pd.DataFrame({{
+            "feature": feat_for_target,
+            "importance": rf.feature_importances_,
+        }}).sort_values("importance", ascending=False)
+        print("\\nHedef değişken özellik önemi:\\n", imp.to_string(index=False))
+
+    # Dirsek taraması
+    print("\\nDirsek (k, inertia):")
+    for k in range(1, min(ELBOW_K_MAX, len(work) - 1) + 1):
+        m = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+        m.fit(X)
+        print(k, float(m.inertia_))
+
+    work.to_csv("analiz_sonucu_etiketli.csv", index=False)
+    print("\\nEtiketli çıktı: analiz_sonucu_etiketli.csv")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _filter_state_fingerprint(
+    cat_filters: dict[str, list[str]],
+    numeric_ranges: dict[str, tuple[float, float]],
+) -> tuple[Any, ...]:
+    """Oturum anahtarı: filtre değişince analiz önbelleğini geçersiz kılmak için."""
+    cat_part = tuple(
+        sorted((k, tuple(sorted(str(x) for x in v))) for k, v in cat_filters.items())
+    )
+    num_part = tuple(
+        sorted((k, (float(lo), float(hi))) for k, (lo, hi) in numeric_ranges.items())
+    )
+    return (cat_part, num_part)
+
+
 def _style_analysis_dataframe(df: pd.DataFrame, *, float_decimals: int) -> Any:
     """Sayıları sabit ondalıkla göster; tamsayı sütunları düzgün biçimle."""
     spec: dict[str, str] = {}
@@ -351,9 +843,14 @@ def _reset_app_session() -> None:
         CONFIG["SESSION_KEYS"]["DEMO_SAMPLE"],
         CONFIG["SESSION_KEYS"]["TEXT_CORPUS_BLOB"],
         CONFIG["SESSION_KEYS"]["DATA_MODE"],
+        "_whatif_fp",
+        "whatif_auto_run",
     )
     for k in keys_to_drop:
         st.session_state.pop(k, None)
+    for k in list(st.session_state.keys()):
+        if str(k).startswith("whatif_df_") or str(k).startswith("whatif_snap_"):
+            st.session_state.pop(k, None)
     st.rerun()
 
 
@@ -372,6 +869,16 @@ def _load_sklearn_demo(name: str) -> pd.DataFrame:
         from sklearn.datasets import load_wine
 
         bundle = load_wine(as_frame=True)
+        return bundle.frame.copy()
+    if name == "california_housing":
+        from sklearn.datasets import fetch_california_housing
+
+        bundle = fetch_california_housing(as_frame=True)
+        return bundle.frame.copy()
+    if name == "diabetes":
+        from sklearn.datasets import load_diabetes
+
+        bundle = load_diabetes(as_frame=True)
         return bundle.frame.copy()
     raise ValueError(f"Bilinmeyen örnek veri: {name!r}")
 
@@ -588,15 +1095,82 @@ def _render_model_interpreter(result: dict[str, Any]) -> None:
         st.info("**Model yorumlayıcı**\n\n" + "\n\n".join(lines))
 
 
-def _inject_theme_aware_code_css() -> None:
-    """Rapor önizlemesindeki ``st.code`` / kod bloklarını Streamlit temasıyla hizalar."""
+def _inject_premium_enterprise_css() -> None:
+    """Kurumsal kimlik: metrik kartları, sidebar degrade, buton hover, kod blokları."""
     st.markdown(
         """
         <style>
+        /* Kod blokları — tema uyumu */
         .stCodeBlock, .stCodeBlock pre, .stCodeBlock code,
         div[data-testid="stCode"] pre, div[data-testid="stCode"] code {
             background-color: var(--secondary-background-color) !important;
             color: var(--text-color) !important;
+        }
+
+        /* Metrik kartları — gölge ve yuvarlatılmış köşe */
+        div[data-testid="stMetric"] {
+            background: var(--secondary-background-color);
+            border: 1px solid rgba(99, 102, 241, 0.12);
+            border-radius: 14px;
+            box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+            padding: 14px 18px;
+            transition: box-shadow 0.2s ease, transform 0.2s ease;
+        }
+        div[data-testid="stMetric"]:hover {
+            box-shadow: 0 6px 20px rgba(79, 70, 229, 0.14);
+            transform: translateY(-1px);
+        }
+        div[data-testid="stMetric"] label {
+            font-weight: 600;
+            letter-spacing: 0.01em;
+        }
+
+        /* Sidebar — hafif kurumsal degrade */
+        section[data-testid="stSidebar"] > div {
+            background: linear-gradient(
+                165deg,
+                rgba(79, 70, 229, 0.07) 0%,
+                rgba(14, 165, 233, 0.05) 45%,
+                var(--background-color) 100%
+            ) !important;
+        }
+        section[data-testid="stSidebar"] .stMarkdown h1,
+        section[data-testid="stSidebar"] .stMarkdown h2,
+        section[data-testid="stSidebar"] .stMarkdown h3 {
+            letter-spacing: -0.02em;
+        }
+
+        /* Birincil / indirme butonları — hover belirginleşme */
+        .stButton > button {
+            border-radius: 10px !important;
+            font-weight: 600 !important;
+            transition: transform 0.18s ease, box-shadow 0.18s ease,
+                filter 0.18s ease !important;
+        }
+        .stButton > button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 18px rgba(79, 70, 229, 0.28) !important;
+            filter: brightness(1.04);
+        }
+        .stButton > button:active {
+            transform: translateY(0);
+        }
+        div[data-testid="stDownloadButton"] > button {
+            border-radius: 10px !important;
+            font-weight: 600 !important;
+            transition: transform 0.18s ease, box-shadow 0.18s ease,
+                filter 0.18s ease !important;
+        }
+        div[data-testid="stDownloadButton"] > button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 18px rgba(14, 165, 233, 0.28) !important;
+            filter: brightness(1.05);
+        }
+
+        /* Sekmeler — ince üst çizgi vurgusu */
+        button[data-baseweb="tab"] {
+            border-radius: 8px 8px 0 0;
+            transition: background 0.15s ease;
         }
         </style>
         """,
@@ -788,6 +1362,7 @@ def _build_academic_report_markdown(
         f"- **K-Means küme sayısı (k):** {n_clusters}",
         f"- **Isolation Forest contamination:** {contamination}",
         f"- **Modele dahil sayısal sütunlar:** {', '.join(feat_cols) if feat_cols else '(yok)'}",
+        f"- **Hedef değişken (RF):** {result.get('target_column') or '(seçilmedi)'}",
         "",
     ]
     if use_log_transform:
@@ -839,6 +1414,25 @@ def _build_academic_report_markdown(
             "- Bu çalıştırmada eşik tabanlı uyarı üretilmedi (Silhouette ve PCA "
             "eşikleri dışında)."
         )
+    tgt_imp = result.get("target_importance_df")
+    tgt_name = str(result.get("target_column") or "")
+    parts.extend(["", "## Hedef değişken özellik önemi (Random Forest)", ""])
+    if isinstance(tgt_imp, pd.DataFrame) and not tgt_imp.empty:
+        parts.append(
+            StatisticalCommentator.feature_importance(
+                tgt_imp, target_name=tgt_name or None
+            )
+        )
+        parts.append("")
+        parts.append(
+            _dataframe_to_markdown_table(
+                tgt_imp.head(10), float_decimals=float_decimals
+            )
+        )
+    elif result.get("err_target_importance"):
+        parts.append(f"- Atlandı: {result['err_target_importance']}")
+    else:
+        parts.append("- Hedef önemi hesaplanmadı.")
     parts.extend(["", "## Küme profilleri (seçilen sütunlarda ortalama)", ""])
     prof_df = cluster_profile_df if cluster_profile_df is not None else analysis_df
     if result.get("labels") is not None and feat_cols:
@@ -899,7 +1493,7 @@ def main() -> None:
         page_title=f'{ui["PAGE_TITLE"]} v{CONFIG["VERSION"]}',
         layout=ui["PAGE_LAYOUT"],
     )
-    _inject_theme_aware_code_css()
+    _inject_premium_enterprise_css()
     icon = ui.get("APP_TITLE_ICON", "")
     st.title(f"{icon} {ui['APP_TITLE']}".strip() if icon else ui["APP_TITLE"])
     st.caption(ui["APP_CAPTION"])
@@ -1061,11 +1655,18 @@ def main() -> None:
 
     analysis_base = cleaned if cleaned is not None else df
 
-    numeric_for_model, _ = DataLoader.infer_column_types(analysis_base)
-    n_rows_model = len(analysis_base)
-    max_k = max(1, n_rows_model - 1) if n_rows_model > 1 else 1
-    default_k = min(int(model["DEFAULT_K_MEANS_CAP"]), max_k)
-    elbow_cap = max(2, min(int(model["ELBOW_K_MAX_UPPER"]), max(1, n_rows_model - 1)))
+    numeric_for_model, categorical_for_model = DataLoader.infer_column_types(
+        analysis_base
+    )
+
+    cat_filters: dict[str, list[str]] = {}
+    numeric_ranges: dict[str, tuple[float, float]] = {}
+    target_variable: str = str(analysis_base.columns[0])
+    datetime_candidates = _detect_datetime_columns(analysis_base)
+    time_column: str | None = None
+    ts_value_column: str | None = None
+    time_series_mode = len(datetime_candidates) > 0
+    whatif_key = _whatif_session_key(upload_fingerprint)
 
     with st.sidebar:
         with st.expander("🗂️ Veri Kaynağı & Filtreleme", expanded=True):
@@ -1088,7 +1689,74 @@ def main() -> None:
                 if len(selected_numeric) < int(model["MIN_NUMERIC_FEATURES"]):
                     st.caption(msg["CAPTION_PICK_TWO_COLUMNS"])
 
+        with st.expander("🔎 Veri Filtresi", expanded=True):
+            st.caption(
+                "Kategori ve sayısal aralık filtreleri seçildiğinde tüm grafikler "
+                "anında güncellenir."
+            )
+            for cat_col in categorical_for_model[:8]:
+                opts = sorted(
+                    analysis_base[cat_col].astype(str).dropna().unique().tolist()
+                )
+                if len(opts) <= 1:
+                    continue
+                picked = st.multiselect(
+                    f"{cat_col}",
+                    options=opts,
+                    default=opts,
+                    key=f"wv_filter_cat_{cat_col}",
+                )
+                cat_filters[cat_col] = picked
+            num_filter_options = ["—"] + list(numeric_for_model)
+            num_filter_col = st.selectbox(
+                "Sayısal aralık filtresi",
+                options=num_filter_options,
+                index=0,
+                key="wv_filter_numeric_col",
+            )
+            if num_filter_col != "—":
+                num_s = pd.to_numeric(
+                    analysis_base[num_filter_col], errors="coerce"
+                ).dropna()
+                if not num_s.empty:
+                    lo_raw, hi_raw = float(num_s.min()), float(num_s.max())
+                    if lo_raw < hi_raw:
+                        rng = st.slider(
+                            f"{num_filter_col} aralığı",
+                            min_value=lo_raw,
+                            max_value=hi_raw,
+                            value=(lo_raw, hi_raw),
+                            key="wv_filter_numeric_rng",
+                        )
+                        numeric_ranges[num_filter_col] = (
+                            float(rng[0]),
+                            float(rng[1]),
+                        )
+
+        filtered_preview = _apply_row_filters(
+            analysis_base,
+            cat_filters=cat_filters,
+            numeric_ranges=numeric_ranges,
+        )
+        n_rows_model = len(filtered_preview)
+        max_k = max(1, n_rows_model - 1) if n_rows_model > 1 else 1
+        default_k = min(int(model["DEFAULT_K_MEANS_CAP"]), max_k)
+        elbow_cap = max(
+            2, min(int(model["ELBOW_K_MAX_UPPER"]), max(1, n_rows_model - 1))
+        )
+
         with st.expander("⚡ Model Parametreleri", expanded=True):
+            col_options = list(analysis_base.columns.astype(str))
+            target_variable = st.selectbox(
+                "Açıklanacak hedef değişken",
+                options=col_options,
+                index=_default_target_column_index(col_options),
+                help=(
+                    "Random Forest özellik önemi, bu değişkeni açıklamada en etkili "
+                    "sütunları gösterir."
+                ),
+                key=sess["TARGET_VARIABLE"],
+            )
             n_clusters = st.number_input(
                 "Küme sayısı (K-Means)",
                 min_value=1,
@@ -1120,8 +1788,60 @@ def main() -> None:
                 help="Her k için K-Means inertia (WCSS) hesaplanır.",
             )
             st.caption(
-                f'PCA: **{model["PCA_COMPONENTS_UI"]} boyut** (PC1, PC2) — sabit.'
+                f'PCA: **{model["PCA_COMPONENTS_UI"]}B + '
+                f'{model["PCA_COMPONENTS_3D"]}B (3D Explorer)** görselleştirme.'
             )
+
+        with st.expander("📈 Zaman Serisi Analiz Modu", expanded=time_series_mode):
+            if datetime_candidates:
+                st.success(
+                    f"Tarih/zaman sütunu tespit edildi — **{len(datetime_candidates)}** aday."
+                )
+                auto_time = datetime_candidates[0]
+                time_opts = list(dict.fromkeys(datetime_candidates))
+                time_column = st.selectbox(
+                    "Zaman ekseni sütunu",
+                    options=time_opts,
+                    index=time_opts.index(auto_time) if auto_time in time_opts else 0,
+                    key=sess["TIME_COLUMN"],
+                )
+                ts_numeric_opts = [
+                    c for c in numeric_for_model if c != time_column
+                ]
+                if ts_numeric_opts:
+                    ts_value_column = st.selectbox(
+                        "İzlenecek metrik (çizgi değeri)",
+                        options=ts_numeric_opts,
+                        index=0,
+                        key=sess["TS_VALUE_COLUMN"],
+                    )
+                else:
+                    st.caption("Zaman serisi için sayısal metrik sütunu seçin.")
+            else:
+                st.caption(
+                    "Otomatik tarih/zaman sütunu bulunamadı. İsimde date/time/timestamp "
+                    "geçen veya %85+ parse edilen sütunlar modu açar."
+                )
+                manual_opts = ["—"] + list(analysis_base.columns.astype(str))
+                manual_time = st.selectbox(
+                    "Manuel zaman sütunu (isteğe bağlı)",
+                    options=manual_opts,
+                    index=0,
+                    key="wv_manual_time_col",
+                )
+                if manual_time != "—":
+                    time_column = manual_time
+                    time_series_mode = True
+                    ts_numeric_opts = [
+                        c for c in numeric_for_model if c != time_column
+                    ]
+                    if ts_numeric_opts:
+                        ts_value_column = st.selectbox(
+                            "İzlenecek metrik",
+                            options=ts_numeric_opts,
+                            index=0,
+                            key="wv_manual_ts_value",
+                        )
 
         with st.expander("🔬 Gelişmiş Ayarlar", expanded=False):
             use_log_transform = st.checkbox(
@@ -1156,6 +1876,35 @@ def main() -> None:
         ):
             _reset_app_session()
 
+    filtered_base = _apply_row_filters(
+        analysis_base,
+        cat_filters=cat_filters,
+        numeric_ranges=numeric_ranges,
+    )
+    if len(filtered_base) == 0:
+        st.warning(
+            "Seçilen filtreler hiç satır bırakmadı; filtreleri genişletin."
+        )
+        return
+    if len(filtered_base) < len(analysis_base):
+        st.caption(
+            f"Veri filtresi aktif: **{len(filtered_base)}** / "
+            f"{len(analysis_base)} satır gösteriliyor."
+        )
+
+    if st.session_state.get("_whatif_fp") != upload_fingerprint:
+        st.session_state[whatif_key] = filtered_base.copy()
+        st.session_state[f"{whatif_key}_snap"] = _dataframe_edit_fingerprint(
+            filtered_base
+        )
+        st.session_state["_whatif_fp"] = upload_fingerprint
+        st.session_state.pop("analiz_result", None)
+
+    analysis_base = st.session_state.get(whatif_key, filtered_base)
+    if not isinstance(analysis_base, pd.DataFrame) or analysis_base.empty:
+        analysis_base = filtered_base.copy()
+        st.session_state[whatif_key] = analysis_base.copy()
+
     min_num_feats = int(model["MIN_NUMERIC_FEATURES"])
     cols_for_log = (
         selected_numeric
@@ -1169,6 +1918,7 @@ def main() -> None:
             analysis_base, columns=cols_for_log
         )
 
+    whatif_fp = st.session_state.get(f"{whatif_key}_snap", "")
     feature_selection_key = (
         upload_fingerprint,
         tuple(sorted(selected_numeric)),
@@ -1177,6 +1927,11 @@ def main() -> None:
         round(float(contamination), 4),
         bool(use_log_transform),
         _data_mode_id(dm_sess),
+        str(target_variable),
+        _filter_state_fingerprint(cat_filters, numeric_ranges),
+        whatif_fp,
+        str(time_column or ""),
+        str(ts_value_column or ""),
     )
     if st.session_state.get("_feature_selection_key") != feature_selection_key:
         st.session_state.pop("analiz_result", None)
@@ -1242,15 +1997,36 @@ def main() -> None:
                 st.json(stats["categorical_top_values"])
 
     with tab_clean:
+        st.markdown("#### Canlı What-If veri düzenleyicisi")
+        st.caption(
+            "Hücreleri düzenleyin veya satır silin; değişiklik sonrası K-Means, PCA ve "
+            "Random Forest modelleri **otomatik** yeniden çalışır."
+        )
+        editor_df = analysis_base.copy()
+        edited_df = st.data_editor(
+            editor_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="wv_whatif_data_editor",
+            hide_index=False,
+        )
+        new_snap = _dataframe_edit_fingerprint(edited_df)
+        old_snap = st.session_state.get(f"{whatif_key}_snap")
+        if old_snap != new_snap:
+            st.session_state[whatif_key] = edited_df.copy()
+            st.session_state[f"{whatif_key}_snap"] = new_snap
+            st.session_state.pop("analiz_result", None)
+            st.session_state["whatif_auto_run"] = True
+            st.rerun()
+
         if cleaned is not None:
-            st.dataframe(
-                cleaned.head(int(prev["RAW_CLEAN_HEAD"])),
-                use_container_width=True,
-            )
-            missing_after = int(cleaned.isna().sum().sum())
-            st.metric("Temizlik sonrası toplam NaN", missing_after)
+            missing_after = int(analysis_base.isna().sum().sum())
+            st.metric("Düzenlenmiş tablo — toplam NaN", missing_after)
+            st.caption(f"**{len(analysis_base)}** satır analize hazır.")
         else:
-            st.error(clean_error or "Temizleme başarısız.")
+            st.warning(
+                clean_error or "Temizleme uygulanamadı; What-If ham veri üzerinde."
+            )
 
     dec = int(fmt["TABLE_FLOAT_DECIMALS"])
     head_n = int(prev["ANALYSIS_TABLE_HEAD"])
@@ -1302,103 +2078,37 @@ def main() -> None:
             )
         if not can_run:
             st.warning(msg["WARN_MIN_NUMERIC"])
+        whatif_auto = bool(st.session_state.pop("whatif_auto_run", False))
         run = st.button(
             "Analizi Çalıştır",
             type="primary",
             disabled=not can_run,
         )
 
-        if run and can_run:
-            labels: pd.Series | None = None
-            pca_coords: pd.DataFrame | None = None
-            pred: pd.Series | None = None
-            err_cluster: str | None = None
-            err_pca: str | None = None
-            err_anomaly: str | None = None
-            inertia_val: float | None = None
-            silhouette_val: float | None = None
-            pca_variance_pct: float | None = None
-            elbow_df: pd.DataFrame | None = None
-            err_elbow: str | None = None
-            cluster_imp_df: pd.DataFrame | None = None
-            err_importance: str | None = None
-
+        if (run or whatif_auto) and can_run:
             with st.spinner(ui["SPINNER_ANALYSIS"]):
-                engine = AIEngine()
-                cols_arg = selected_numeric
-                try:
-                    raw_labels, inertia_val, silhouette_val = engine.perform_clustering(
-                        analysis_df,
-                        n_clusters,
-                        numeric_columns=cols_arg,
-                    )
-                    labels = pd.Series(raw_labels, index=analysis_df.index)
-                except AIModelError as exc:
-                    err_cluster = str(exc)
-                    inertia_val = None
-                    silhouette_val = None
-
-                try:
-                    pca_coords, pca_var_info = engine.perform_pca(
-                        analysis_df,
-                        n_components=int(model["PCA_COMPONENTS_UI"]),
-                        numeric_columns=cols_arg,
-                    )
-                    pca_variance_pct = float(pca_var_info["variance_explained_pct"])
-                except AIModelError as exc:
-                    err_pca = str(exc)
-                    pca_variance_pct = None
-
-                try:
-                    raw_pred = engine.detect_anomalies(
-                        analysis_df,
-                        contamination=contamination,
-                        numeric_columns=cols_arg,
-                    )
-                    pred = pd.Series(raw_pred, index=analysis_df.index)
-                except AIModelError as exc:
-                    err_anomaly = str(exc)
-
-                try:
-                    elbow_df = engine.elbow_inertia_scan(
-                        analysis_df,
-                        k_max=elbow_k_max,
-                        numeric_columns=cols_arg,
-                    )
-                except AIModelError as exc:
-                    err_elbow = str(exc)
-                    elbow_df = None
-
-                if err_cluster is None and labels is not None:
-                    try:
-                        if len(np.unique(labels.to_numpy())) >= 2:
-                            cluster_imp_df = engine.cluster_feature_importance_rf(
-                                analysis_df,
-                                labels.to_numpy(),
-                                numeric_columns=cols_arg,
-                            )
-                    except AIModelError as exc:
-                        err_importance = str(exc)
-
+                pipeline_out = _run_analysis_pipeline(
+                    analysis_df,
+                    n_clusters=int(n_clusters),
+                    contamination=float(contamination),
+                    elbow_k_max=int(elbow_k_max),
+                    selected_numeric=list(selected_numeric),
+                    target_variable=str(target_variable),
+                    pca_components_2d=int(model["PCA_COMPONENTS_UI"]),
+                    pca_components_3d=int(model["PCA_COMPONENTS_3D"]),
+                )
             st.session_state["analiz_result"] = {
-                "labels": labels,
-                "pca_coords": pca_coords,
-                "pred": pred,
-                "err_cluster": err_cluster,
-                "err_pca": err_pca,
-                "err_anomaly": err_anomaly,
-                "n_clusters": n_clusters,
-                "inertia": inertia_val,
-                "silhouette": silhouette_val,
-                "pca_variance_pct": pca_variance_pct,
-                "elbow_df": elbow_df,
-                "err_elbow": err_elbow,
-                "feature_columns": list(selected_numeric),
+                **pipeline_out,
                 "use_log_transform": bool(use_log_transform),
                 "log_skipped_columns": list(log_skipped_cols),
-                "cluster_importance_df": cluster_imp_df,
-                "err_importance": err_importance,
+                "time_column": time_column,
+                "ts_value_column": ts_value_column,
+                "time_series_mode": bool(
+                    time_series_mode and time_column and ts_value_column
+                ),
             }
+            if whatif_auto:
+                st.toast("What-If düzenlemesi uygulandı — modeller yenilendi.", icon="✨")
 
         result: dict[str, Any] | None = st.session_state.get("analiz_result")
         if result is None:
@@ -1415,14 +2125,99 @@ def main() -> None:
         else:
             viz = DataVisualizer(theme=_streamlit_theme())
             tips_cfg: dict[str, str] = CONFIG.get("PRESENTATION_TIPS", {})
+            commentator = StatisticalCommentator()
 
             feat_cols = result.get("feature_columns") or selected_numeric
+            target_col = str(
+                result.get("target_column") or target_variable or ""
+            )
             if feat_cols:
                 st.caption(
                     "Modele giren sayısal sütunlar: **"
                     + "**, **".join(feat_cols)
                     + "**"
                 )
+            if target_col:
+                st.caption(f"Hedef değişken (RF odak): **{target_col}**")
+
+            target_imp = result.get("target_importance_df")
+            if isinstance(target_imp, pd.DataFrame) and not target_imp.empty:
+                st.markdown("### Hedef değişken özellik önemi (Random Forest)")
+                st.caption(
+                    f"**{target_col}** değişkenini açıklamada en etkili sütunlar "
+                    "(normalize önem, toplam = 1)."
+                )
+                try:
+                    fig_tgt = viz.plot_target_feature_importance(
+                        target_imp,
+                        target_column=target_col,
+                    )
+                    _render_plotly_static(fig_tgt, key="wv_plot_target_imp")
+                    _render_ai_comment(
+                        commentator.feature_importance(
+                            target_imp, target_name=target_col
+                        )
+                    )
+                    _academic_tip_if(
+                        show_academic_tips,
+                        tips_cfg.get("rf_importance", ""),
+                    )
+                except ValueError as exc:
+                    st.warning(str(exc))
+            elif result.get("err_target_importance"):
+                st.caption(
+                    f"Hedef önemi atlandı: {result['err_target_importance']}"
+                )
+
+            st.markdown("### Akıllı iki değişken analizi")
+            st.caption(
+                "Sütun tiplerine göre otomatik scatter, kutu veya çubuk grafiği seçilir."
+            )
+            smart_cols = list(analysis_base.columns.astype(str))
+            if len(smart_cols) >= 2:
+                sc1, sc2 = st.columns(2)
+                with sc1:
+                    smart_a = st.selectbox(
+                        "Sütun A",
+                        options=smart_cols,
+                        index=0,
+                        key="wv_smart_col_a",
+                    )
+                with sc2:
+                    smart_b_default = 1 if len(smart_cols) > 1 else 0
+                    smart_b = st.selectbox(
+                        "Sütun B",
+                        options=smart_cols,
+                        index=smart_b_default,
+                        key="wv_smart_col_b",
+                    )
+                if smart_a != smart_b:
+                    try:
+                        fig_smart, smart_kind, smart_comment = (
+                            viz.plot_smart_bivariate(
+                                analysis_base,
+                                smart_a,
+                                smart_b,
+                            )
+                        )
+                        _render_plotly_static(
+                            fig_smart, key="wv_plot_smart_bivariate"
+                        )
+                        _render_ai_comment(smart_comment)
+                        st.caption(
+                            f"Seçilen grafik türü: **{smart_kind}** "
+                            f"({smart_a} × {smart_b})."
+                        )
+                        _academic_tip_if(
+                            show_academic_tips,
+                            tips_cfg.get("smart_chart", ""),
+                        )
+                    except ValueError as exc:
+                        st.warning(str(exc))
+                else:
+                    st.caption("İki farklı sütun seçin.")
+            else:
+                st.info("Akıllı grafik için en az iki sütun gerekir.")
 
             st.markdown("### Korelasyon (ısı haritası)")
             if len(feat_cols) >= min_num:
@@ -1435,6 +2230,9 @@ def main() -> None:
                         ),
                     )
                     _render_plotly_static(fig_hm, key="wv_plot_corr")
+                    _render_ai_comment(
+                        commentator.correlation_heatmap(analysis_df, feat_cols)
+                    )
                     _academic_tip_if(
                         show_academic_tips,
                         tips_cfg.get("correlation", ""),
@@ -1460,6 +2258,12 @@ def main() -> None:
                         ),
                     )
                     _render_plotly_static(fig_e, key="wv_plot_elbow")
+                    _render_ai_comment(
+                        commentator.elbow(
+                            result["elbow_df"],
+                            int(n_clusters),
+                        )
+                    )
                     _academic_tip_if(
                         show_academic_tips,
                         tips_cfg.get("elbow", ""),
@@ -1501,6 +2305,12 @@ def main() -> None:
                     show_academic_tips,
                     tips_cfg.get("clustering", ""),
                 )
+                _render_ai_comment(
+                    commentator.silhouette(
+                        result.get("silhouette"),
+                        int(result.get("n_clusters", n_clusters)),
+                    )
+                )
                 st.write(
                     f"**{result['n_clusters']}** küme, **{len(labels)}** satır."
                 )
@@ -1541,22 +2351,22 @@ def main() -> None:
 
                 imp_df = result.get("cluster_importance_df")
                 if isinstance(imp_df, pd.DataFrame) and not imp_df.empty:
-                    st.markdown("#### Küme önem derecesi (Random Forest)")
+                    st.markdown("#### Küme ayırma önemi (Random Forest — ek)")
                     st.caption(
-                        "K-Means etiketleri hedef alınarak ölçeklenmiş özelliklerde "
-                        "Random Forest ile yaklaşık ayırma önemleri (normalize, toplam 1)."
+                        "K-Means etiketlerini sınıf kabul eden ek keşifsel önem analizi."
                     )
                     try:
                         fig_imp = viz.plot_cluster_feature_importance(imp_df)
                         _render_plotly_static(fig_imp, key="wv_plot_cluster_imp")
-                        _academic_tip_if(
-                            show_academic_tips,
-                            tips_cfg.get("rf_importance", ""),
+                        _render_ai_comment(
+                            commentator.feature_importance(
+                                imp_df, target_name="K-Means kümeleri"
+                            )
                         )
                     except ValueError as exc:
                         st.warning(str(exc))
                 elif result.get("err_importance"):
-                    st.caption(f"Önem analizi atlandı: {result['err_importance']}")
+                    st.caption(f"Küme önemi atlandı: {result['err_importance']}")
 
                 box_opts = [c for c in feat_cols if c in analysis_base.columns]
                 if box_opts:
@@ -1578,6 +2388,16 @@ def main() -> None:
                             title=f"{box_col} — küme bazında dağılım",
                         )
                         _render_plotly_static(fig_box, key="wv_plot_cluster_box")
+                        box_comment_df = analysis_base.copy()
+                        box_comment_df["Küme"] = labels.astype(int).astype(str)
+                        _render_ai_comment(
+                            commentator.boxplot_by_group(
+                                box_comment_df,
+                                box_col,
+                                "Küme",
+                                group_label="kümede",
+                            )
+                        )
                     except ValueError as exc:
                         st.warning(str(exc))
 
@@ -1609,10 +2429,45 @@ def main() -> None:
                                 f"**%{pv:.2f}** kadarını temsil etmektedir "
                                 "(PCA açıklanan varyans oranı; ölçeklenmiş sayısal sütunlar)."
                             )
+                        _render_ai_comment(
+                            commentator.silhouette(
+                                result.get("silhouette"),
+                                int(result.get("n_clusters", n_clusters)),
+                            )
+                        )
                     except ValueError as exc:
                         st.warning(f"Küme grafiği oluşturulamadı: {exc}")
 
-                st.markdown("#### Manuel sütun kıyaslaması")
+                pca_3d = result.get("pca_coords_3d")
+                if pca_3d is not None and labels is not None:
+                    st.markdown("#### 3D PCA Explorer (PC1 · PC2 · PC3)")
+                    st.caption(
+                        "Fareyle döndürün; küme sınırlarını derinlik algısıyla inceleyin."
+                    )
+                    if result.get("err_pca_3d"):
+                        st.warning(f"3D PCA: {result['err_pca_3d']}")
+                    try:
+                        pca3_enriched = pca_3d.join(analysis_df, how="left")
+                        pv3 = result.get("pca_variance_pct_3d")
+                        fig_3d = viz.plot_3d_pca_clusters(
+                            pca3_enriched,
+                            labels.values,
+                            variance_explained_pct=float(pv3)
+                            if pv3 is not None
+                            else None,
+                            chart_height=680,
+                        )
+                        _render_plotly_static(fig_3d, key="wv_plot_pca_3d")
+                        if pv3 is not None:
+                            _render_ai_comment(
+                                f"PC1+PC2+PC3 ile açıklanan varyans **%{float(pv3):.1f}** "
+                                "(ölçeklenmiş uzay); 3B görünüm bilgi kaybını 2B'ye göre "
+                                "azaltır."
+                            )
+                    except ValueError as exc:
+                        st.warning(f"3D PCA grafiği oluşturulamadı: {exc}")
+
+                st.markdown("#### Manuel sütun kıyaslaması (K-Means renkli)")
                 st.caption(
                     "İki gerçek özelliği seçin; noktalar K-Means küme rengiyle boyanır "
                     "(PCA’daki PC1/PC2’den farklı olarak eksenler doğrudan yorumlanır)."
@@ -1643,26 +2498,41 @@ def main() -> None:
                     if mx != my:
                         try:
                             plot_align = analysis_base.loc[labels.index]
-                            fig_m = viz.plot_manual_cluster_scatter(
-                                plot_align,
-                                mx,
-                                my,
-                                labels.values,
-                                title=f"{mx} vs {my} ilişkisi (K-Means renkleri)",
+                            fig_m, man_kind, man_comment = (
+                                viz.plot_smart_bivariate(
+                                    plot_align,
+                                    mx,
+                                    my,
+                                    title=f"{mx} vs {my} (akıllı grafik + K-Means)",
+                                    labels=labels.values,
+                                )
                             )
-                            _render_plotly_interactive(
-                                fig_m,
-                                key="wv_plot_manual_scatter",
-                                selection_base=plot_align,
-                                float_decimals=dec,
-                                show_selection_hint=True,
-                            )
+                            if man_kind == "scatter":
+                                fig_m = viz.plot_manual_cluster_scatter(
+                                    plot_align,
+                                    mx,
+                                    my,
+                                    labels.values,
+                                    title=f"{mx} vs {my} ilişkisi (K-Means renkleri)",
+                                )
+                                _render_plotly_interactive(
+                                    fig_m,
+                                    key="wv_plot_manual_scatter",
+                                    selection_base=plot_align,
+                                    float_decimals=dec,
+                                    show_selection_hint=True,
+                                )
+                            else:
+                                _render_plotly_static(
+                                    fig_m, key="wv_plot_manual_smart"
+                                )
+                            _render_ai_comment(man_comment)
                             _academic_tip_if(
                                 show_academic_tips,
                                 tips_cfg.get("manual_scatter", ""),
                             )
                         except ValueError as exc:
-                            st.warning(f"Manuel saçılım oluşturulamadı: {exc}")
+                            st.warning(f"Manuel grafik oluşturulamadı: {exc}")
                     else:
                         st.caption("X ve Y için farklı sütun seçin.")
                 else:
@@ -1726,6 +2596,34 @@ def main() -> None:
                 st.write(
                     f"Tahmin özeti: **{n_out}** anomali (-1), **{n_in}** normal (1)."
                 )
+                if (
+                    result.get("time_series_mode")
+                    and result.get("time_column")
+                    and result.get("ts_value_column")
+                ):
+                    st.markdown("#### Zaman serisi anomali motoru")
+                    st.caption(
+                        "Sistem logları / sensör verisi: çizgi üzerinde kırmızı sıçrama "
+                        "noktaları Isolation Forest aykırılarını işaretler."
+                    )
+                    tcol = str(result["time_column"])
+                    vcol = str(result["ts_value_column"])
+                    try:
+                        fig_ts = viz.plot_timeseries_anomalies(
+                            analysis_base,
+                            tcol,
+                            vcol,
+                            pred.values,
+                            title=f"Zaman serisi — {vcol} (anomali sıçramaları)",
+                        )
+                        _render_plotly_static(fig_ts, key="wv_plot_timeseries_anom")
+                        _render_ai_comment(
+                            f"**{tcol}** ekseninde **{vcol}** izlendi; **{n_out}** anomali "
+                            f"noktası kırmızı sıçrama olarak işaretlendi (~%"
+                            f"{100.0 * n_out / max(1, len(pred)):.1f} oran)."
+                        )
+                    except ValueError as exc:
+                        st.warning(f"Zaman serisi grafiği: {exc}")
                 st.dataframe(
                     _style_analysis_dataframe(
                         anomaly_view.head(head_n),
@@ -1789,6 +2687,11 @@ def main() -> None:
                             float_decimals=dec,
                             show_selection_hint=False,
                         )
+                        _render_ai_comment(
+                            f"Isolation Forest **{n_out}** aykırı (toplam "
+                            f"{len(pred)} gözlemin ~%{100.0 * n_out / max(1, len(pred)):.1f}'i) "
+                            "işaretlemiştir; kırmızı noktalar düşük yoğunluk adaylarıdır."
+                        )
                         _academic_tip_if(
                             show_academic_tips,
                             tips_cfg.get("anomaly", ""),
@@ -1814,6 +2717,9 @@ def main() -> None:
                     title=f"Özellik dağılımı: {col_pick}",
                 )
                 _render_plotly_static(fig_d, key="wv_plot_feature")
+                _render_ai_comment(
+                    commentator.distribution(analysis_base, col_pick)
+                )
                 _academic_tip_if(
                     show_academic_tips,
                     tips_cfg.get("feature_dist", ""),
@@ -1859,14 +2765,99 @@ def main() -> None:
                 st.markdown(report_md)
                 st.markdown("**Ham Markdown kaynağı** (`language=\"markdown\"`)")
                 st.code(report_md, language="markdown")
-            st.download_button(
-                label=ui["BTN_DOWNLOAD_REPORT"],
-                data=report_md.encode("utf-8"),
-                file_name=f'{ui["REPORT_FILENAME_PREFIX"]}_v{CONFIG["VERSION"]}.txt',
-                mime="text/plain",
-                help="Silhouette, PCA, sütunlar, küme ortalamaları ve model yorumları (Markdown, .txt).",
-                use_container_width=True,
-                key="wv_download_academic_report",
+            code_py = _build_reproducible_analysis_script(
+                feature_columns=list(feat_cols),
+                target_column=str(target_col),
+                n_clusters=int(n_clusters),
+                contamination=float(contamination),
+                elbow_k_max=int(elbow_k_max),
+                use_log_transform=bool(result.get("use_log_transform")),
+                app_version=str(CONFIG["VERSION"]),
+                time_column=result.get("time_column"),
+                ts_value_column=result.get("ts_value_column"),
+            )
+            try:
+                excel_bytes = _build_multi_sheet_excel_bytes(analysis_base, result)
+            except (ValueError, OSError, ImportError) as exc:
+                excel_bytes = None
+                st.caption(f"Excel dışa aktarımı hazırlanamadı: {exc}")
+
+            models_zip = result.get("models_zip_bytes")
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    label=ui["BTN_DOWNLOAD_REPORT"],
+                    data=report_md.encode("utf-8"),
+                    file_name=(
+                        f'{ui["REPORT_FILENAME_PREFIX"]}_v{CONFIG["VERSION"]}.txt'
+                    ),
+                    mime="text/plain",
+                    help=(
+                        "Silhouette, PCA, sütunlar, küme ortalamaları ve model "
+                        "yorumları (Markdown, .txt)."
+                    ),
+                    use_container_width=True,
+                    key="wv_download_academic_report",
+                )
+            with dl2:
+                st.download_button(
+                    label=ui["BTN_DOWNLOAD_CODE"],
+                    data=code_py.encode("utf-8"),
+                    file_name=(
+                        f'{ui["CODE_FILENAME_PREFIX"]}_v{CONFIG["VERSION"]}.py'
+                    ),
+                    mime="text/x-python",
+                    help=(
+                        "Panel ayarlarınızla aynı sklearn/pandas analizini yerelde "
+                        "tekrarlayan şeffaf Python betiği."
+                    ),
+                    use_container_width=True,
+                    key="wv_download_analysis_code",
+                )
+            dl3, dl4 = st.columns(2)
+            with dl3:
+                if excel_bytes:
+                    st.download_button(
+                        label=ui["BTN_DOWNLOAD_EXCEL"],
+                        data=excel_bytes,
+                        file_name=(
+                            f'{ui["EXCEL_FILENAME_PREFIX"]}_v{CONFIG["VERSION"]}.xlsx'
+                        ),
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "spreadsheetml.sheet"
+                        ),
+                        help=(
+                            "3 sekme: Cleaned Data (Cluster_ID), Anomalies, Summary."
+                        ),
+                        use_container_width=True,
+                        key="wv_download_excel_workbook",
+                    )
+                else:
+                    st.caption("Excel indirme bu oturumda kullanılamıyor.")
+            with dl4:
+                if isinstance(models_zip, bytes) and len(models_zip) > 0:
+                    st.download_button(
+                        label=ui["BTN_DOWNLOAD_MODELS"],
+                        data=models_zip,
+                        file_name=(
+                            f'{ui["MODELS_ZIP_PREFIX"]}_v{CONFIG["VERSION"]}.zip'
+                        ),
+                        mime="application/zip",
+                        help=(
+                            "K-Means, Isolation Forest, Random Forest + scaler "
+                            "dosyaları (joblib .pkl)."
+                        ),
+                        use_container_width=True,
+                        key="wv_download_models_zip",
+                    )
+                elif result.get("err_models_zip"):
+                    st.caption(f"Model ZIP: {result['err_models_zip']}")
+                else:
+                    st.caption("Model ZIP henüz üretilmedi; analizi yeniden çalıştırın.")
+            st.caption(
+                "Kurumsal dışa aktarım: çok sayfalı Excel, şeffaf `.py` betiği ve "
+                "canlı ortama alınabilir `.zip` model paketi — kara kutu değildir."
             )
             st.markdown(
                 CONFIG.get("UI", {}).get(
@@ -1949,24 +2940,34 @@ def main() -> None:
                 except ValueError as exc:
                     st.warning(str(exc))
 
-            st.markdown("### Kümelenmeyi en çok etkileyen faktörler")
-            imp_ex = rex.get("cluster_importance_df")
-            if isinstance(imp_ex, pd.DataFrame) and not imp_ex.empty:
+            st.markdown("### Hedef değişkeni en çok etkileyen faktörler")
+            tgt_ex = rex.get("target_importance_df")
+            tgt_name_ex = str(rex.get("target_column") or target_variable or "")
+            if isinstance(tgt_ex, pd.DataFrame) and not tgt_ex.empty:
                 try:
-                    fig_ei = viz_ex.plot_cluster_feature_importance(
-                        imp_ex,
-                        title="Random Forest özellik önemi — yönetici özeti",
+                    fig_ei = viz_ex.plot_target_feature_importance(
+                        tgt_ex,
+                        target_column=tgt_name_ex,
+                        title=(
+                            f"Hedef: {tgt_name_ex} — Random Forest özellik önemi "
+                            "(yönetici özeti)"
+                        ),
                         chart_height=ex_h,
                     )
                     _render_plotly_static(fig_ei, key="wv_exec_importance")
+                    _render_ai_comment(
+                        StatisticalCommentator.feature_importance(
+                            tgt_ex, target_name=tgt_name_ex
+                        )
+                    )
                 except ValueError as exc:
                     st.warning(str(exc))
-            elif rex.get("err_importance"):
-                st.info(f"Önem analizi: {rex['err_importance']}")
+            elif rex.get("err_target_importance"):
+                st.info(f"Hedef önemi: {rex['err_target_importance']}")
             else:
                 st.info(
-                    "Özellik önemi için en az iki küme ve başarılı kümeleme gerekir "
-                    "(Analiz sekmesinde RF bölümüne bakın)."
+                    "Hedef değişken özellik önemi için Analiz sekmesinde analizi "
+                    "çalıştırın ve hedef sütun seçin."
                 )
 
     with st.expander("Geliştirici notu"):
