@@ -101,6 +101,67 @@ def is_categorical_or_low_variance(df: pd.DataFrame, column: str) -> bool:
     return True
 
 
+def column_decision_type_label(df: pd.DataFrame, column: str) -> str:
+    """Akıllı karar matrisi için sütun rol etiketi (Sürekli / Sayısal / Kategorik)."""
+    if column not in df.columns:
+        return "Kategorik"
+    if is_continuous_numeric(df, column):
+        return "Sürekli"
+    inferred_numeric, categorical = DataLoader.infer_column_types(df)
+    if column in categorical:
+        return "Kategorik"
+    if column in inferred_numeric:
+        return "Sayısal"
+    return "Kategorik"
+
+
+def build_bivariate_decision_banner(
+    df: pd.DataFrame,
+    col_a: str,
+    col_b: str,
+    chart_kind: SmartChartKind,
+) -> str:
+    """İki değişkenli grafik seçiminin gerekçesini kullanıcı dilinde özetler."""
+    label_a = column_decision_type_label(df, col_a)
+    label_b = column_decision_type_label(df, col_b)
+    if chart_kind == "scatter":
+        return (
+            f"💡 <strong>Sistem Kararı:</strong> <strong>{col_a}</strong> ({label_a}) × "
+            f"<strong>{col_b}</strong> ({label_b}) ilişkisi tespit edildi. İki sayısal "
+            "değişkenin korelasyonunu ve dağılımını göstermek için en uygun görsel olan "
+            "<strong>Saçılım Grafiği</strong> otomatik olarak seçildi."
+        )
+    if chart_kind == "box":
+        return (
+            f"💡 <strong>Sistem Kararı:</strong> <strong>{col_a}</strong> ({label_a}) × "
+            f"<strong>{col_b}</strong> ({label_b}) ilişkisi tespit edildi. Grupların "
+            "merkeze eğilimini ve varyans dağılımını kıyaslamak için en uygun görsel olan "
+            "<strong>Kutu Grafiği</strong> otomatik olarak seçildi."
+        )
+    return (
+        f"💡 <strong>Sistem Kararı:</strong> <strong>{col_a}</strong> ({label_a}) × "
+        f"<strong>{col_b}</strong> ({label_b}) ilişkisi tespit edildi. Kategorik "
+        "grupların ortalama düzeyini karşılaştırmak için en uygun görsel olan "
+        "<strong>Çubuk Grafiği</strong> otomatik olarak seçildi."
+    )
+
+
+def count_structure_variables(df: pd.DataFrame) -> tuple[int, int]:
+    """Filtre sonrası sürekli ve kategorik (ayrık dahil) sütun sayılarını döner."""
+    if df.empty or len(df.columns) == 0:
+        return 0, 0
+    inferred_numeric, categorical = DataLoader.infer_column_types(df)
+    n_continuous = sum(
+        1 for col in df.columns if is_continuous_numeric(df, str(col))
+    )
+    n_categorical = len(categorical) + sum(
+        1
+        for col in inferred_numeric
+        if not is_continuous_numeric(df, str(col))
+    )
+    return n_continuous, n_categorical
+
+
 def recommend_bivariate_chart(
     df: pd.DataFrame,
     col_a: str,
@@ -198,6 +259,30 @@ class StatisticalCommentator:
         return (
             f"**{category_col}** kırılımında **{value_col}** ortalaması en yüksek "
             f"**{top}** kategorisinde, en düşük **{bot}** kategorisindedir."
+        )
+
+    @staticmethod
+    def missing_data_repair(
+        raw_df: pd.DataFrame,
+        cleaned_df: pd.DataFrame | None,
+        *,
+        method_label: str,
+    ) -> str:
+        """Eksik veri ısı haritası altı imputation özeti."""
+        n_miss = int(raw_df.isna().sum().sum())
+        if n_miss == 0:
+            return (
+                "Ham veride eksik hücre tespit edilmedi; temizleme adımı "
+                "yapısal bütünlük kontrolü olarak geçildi."
+            )
+        if cleaned_df is None:
+            return (
+                f"Sistem verideki **{n_miss:,}** eksik hücreyi tespit etti; "
+                "otomatik onarım bu oturumda uygulanmadı (ham veri modu)."
+            )
+        return (
+            f"Sistem verideki eksikleri tespit etti ve **{method_label}** yöntemiyle "
+            f"otomatik olarak onardı (**{n_miss:,}** hücre etkilendi)."
         )
 
     @staticmethod
@@ -997,6 +1082,53 @@ class DataVisualizer:
             )
         )
         fig.update_xaxes(side="bottom")
+        return fig
+
+    def plot_missing_data_matrix(
+        self,
+        df: pd.DataFrame,
+        *,
+        max_rows: int = 120,
+        title: str | None = None,
+    ) -> Figure:
+        """Ham verideki eksik (NaN) hücreleri satır×sütun ısı haritası olarak gösterir."""
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            raise ValueError("df must be a non-empty pandas DataFrame.")
+        n = max(1, min(int(max_rows), len(df)))
+        sub = df.iloc[:n].copy()
+        missing = sub.isna().astype(int)
+        row_labels = [f"Satır {i + 1}" for i in range(n)]
+        fig = px.imshow(
+            missing.values,
+            x=[str(c) for c in sub.columns],
+            y=row_labels,
+            color_continuous_scale=[
+                [0.0, "#22C55E"],
+                [0.5, "#FDE68A"],
+                [1.0, "#EF4444"],
+            ],
+            zmin=0,
+            zmax=1,
+            labels=dict(color="Eksik (1=NaN)"),
+        )
+        fig.update_traces(
+            hovertemplate="Satır=%{y}<br>Sütun=%{x}<br>Eksik=%{z}<extra></extra>",
+        )
+        md_title = (
+            title
+            if title is not None
+            else f"Kayıp veri matrisi (ilk {n} satır)"
+        )
+        h = min(560, 80 + n * 4)
+        fig.update_layout(
+            **self._base_layout(
+                md_title,
+                xaxis_title="Sütun",
+                yaxis_title="Gözlem",
+                height=h,
+            )
+        )
+        fig.update_xaxes(tickangle=-35)
         return fig
 
     def plot_cluster_feature_importance(

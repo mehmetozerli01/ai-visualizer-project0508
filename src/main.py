@@ -14,6 +14,7 @@ matematiksel modeller :mod:`ai_engine` içindedir.
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from io import BytesIO
 from typing import Any, Literal
@@ -26,18 +27,23 @@ import streamlit as st
 from ai_engine import AIEngine
 from exceptions import AIModelError, DataLoadError, PreprocessingError
 from processor import DataLoader
-from visualizer import DataVisualizer, StatisticalCommentator
+from visualizer import (
+    DataVisualizer,
+    StatisticalCommentator,
+    build_bivariate_decision_banner,
+    count_structure_variables,
+)
 
 # --- Merkezi ayarlar (bakım / tema / varsayılanlar) -----------------------------
 CONFIG: dict[str, Any] = {
-    "VERSION": "1.0.0",
+    "VERSION": "1.2.0",
     "UI": {
         "PAGE_TITLE": "AI Visualizer",
         "PAGE_LAYOUT": "wide",
-        "APP_TITLE": "AI Visualizer — Başyapıt v1.0.0",
+        "APP_TITLE": "AI Visualizer — Fortune 500 BI Dashboard v1.2.0",
         "APP_CAPTION": (
-            "Kurumsal veri platformu: çok sayfalı Excel, model serileştirme, "
-            "What-If analiz ve premium görselleştirme."
+            "Executive KPI kartları, veri sağlığı ısı haritası, doğal dil Q&A "
+            "asistanı ve jüri sunum modu."
         ),
         "FILE_UPLOADER_LABEL": "CSV / Excel dosyası",
         "FILE_EXTENSIONS": ["csv", "xlsx", "xlsm"],
@@ -54,6 +60,8 @@ CONFIG: dict[str, Any] = {
         "BTN_DOWNLOAD_CODE": "💻 Analiz Kodunu İndir (.py)",
         "BTN_DOWNLOAD_EXCEL": "📊 Temizlenmiş Veriyi İndir (.xlsx)",
         "BTN_DOWNLOAD_MODELS": "🧠 Eğitilmiş Modelleri İndir (.zip)",
+        "BTN_DOWNLOAD_PDF": "📄 Yönetici Özetini İndir (.pdf)",
+        "PDF_FILENAME_PREFIX": "yonetici_ozeti",
         "CODE_FILENAME_PREFIX": "ai_visualizer_reproducible_analysis",
         "EXCEL_FILENAME_PREFIX": "ai_visualizer_cleaned_export",
         "MODELS_ZIP_PREFIX": "ai_visualizer_trained_models",
@@ -75,20 +83,33 @@ CONFIG: dict[str, Any] = {
         "REPORT_PREVIEW_EXPANDER": "📄 İndirilecek rapor önizlemesi",
         "REPORT_STRATEGY_SECTION_MD": "## 🤖 AI Stratejik Tavsiyeler",
         "FOOTER_TEXT": (
-            "v1.0.0 RC | Mehmet Özerli — Kurumsal platform (Excel export, model ZIP, premium UI)"
+            "v1.2.0 | Mehmet Özerli — Executive BI dashboard, veri sağlığı haritası, "
+            "AI Q&A ve jüri sunum modu"
+        ),
+        "DATA_QA_PLACEHOLDER": "🔍 Verinize Soru Sorun (Örn: En yüksek değerli küme hangisi?)",
+        "DATA_QA_HINT": (
+            "Küme, ortalama, anomali, silhouette veya hedef önemi hakkında Türkçe soru yazın."
+        ),
+        "JURY_MODE_LABEL": "🎬 Jüri Sunum Modu",
+        "JURY_MODE_HELP": (
+            "Açıkken sidebar ve kalabalık paneller gizlenir; 3D PCA, karar bantları ve "
+            "stratejik AI yorumları slayt düzeninde kalır."
         ),
         "DATA_MODE_LABEL": "Veri Türü Seçin",
         "DATA_MODES": {
-            "tabular": "📊 Tabüler (Klasik Excel/CSV)",
-            "text_corpus": "✍️ Metin Derlemi (Text Corpus)",
-            "audio_features": "🔊 Ses Özellikleri (Audio Features)",
-            "image_features": "🖼️ Görüntü Koleksiyonu (İndeks 3)",
+            "tabular": "📊 Tabüler Veri (Excel/CSV)",
+            "text_corpus": "📝 Metin Derlemi (NLP)",
+            "audio_features": "🔊 Ses Sinyalleri (Frekans)",
+            "image_features": "🔬 Medikal Görüntü (Hücre Analizi)",
         },
         "UPLOADER_HELP_BY_MODE": {
             "tabular": "CSV veya Excel (.xlsx). Excel için openpyxl gerekir.",
             "text_corpus": ".txt — birden fazla belge için paragraflar arasında boş satırlar (3+ newline) kullanın.",
-            "audio_features": "Yer tutucu dosya (.txt/.csv). Gerçek WAV ayrıştırması yok; dosya adında 'audio' geçerse tohum farklılaşır.",
-            "image_features": "Yer tutucu dosya. 100 görsel satırı simüle edilir; gerçekte CNN veya OpenCV özellikleri beslenir.",
+            "audio_features": "Yer tutucu dosya (.txt/.csv). Frekans özellikleri simüle edilir; dosya adında 'audio' geçerse tohum farklılaşır.",
+            "image_features": (
+                "Kan hücresi mikroskopi simülasyonu: çap, çekirdek yoğunluğu ve "
+                "şekil bozukluğu özellikleri üretilir (CNN/OpenCV entegrasyonu için hazır)."
+            ),
         },
     },
     "MODEL": {
@@ -222,9 +243,8 @@ CONFIG: dict[str, Any] = {
         ),
     },
     "VISION_NOTE": (
-        "Bu platform; Finansal Tahminleme, Müşteri Segmentasyonu ve Endüstriyel "
-        "Anomali Tespiti gibi çok modlu veri setlerinde derinlemesine analiz "
-        "yapabilmek için tasarlanmıştır."
+        "HealthTech vizyonu: kan hücresi morfometrisi, sunucu loglarında zaman "
+        "serisi anomali ve klasik tabüler analiz tek platformda birleşir."
     ),
     # Plotly / UI ile hizalı referans palet (grafik modülü ayrı; burada tek kaynak).
     "COLORS": {
@@ -249,10 +269,21 @@ _DEMO_DATASET_LABELS: dict[str, str] = {
 
 _TARGET_COLUMN_HINTS: tuple[str, ...] = (
     "target",
+    "irregularity_score",
+    "nucleus_density",
     "medhouseval",
     "price",
     "label",
     "y",
+)
+
+_MODE_TARGET_HINTS: dict[str, str] = {
+    "image_features": "irregularity_score",
+    "audio_features": "amplitude_rms",
+}
+
+_EXPORT_INDEX_SKIP: frozenset[str] = frozenset(
+    {"cell_id", "sample_id", "doc_id", "image_id"}
 )
 
 _DATETIME_NAME_HINTS: tuple[str, ...] = (
@@ -368,6 +399,38 @@ def _render_ai_comment(text: str) -> None:
         st.info(f"🤖 **AI Yorumu:** {text.strip()}")
 
 
+def _resolve_deploy_target(
+    df: pd.DataFrame,
+    target_variable: str,
+    data_mode_id: str,
+) -> str:
+    """Multimodal modlarda RF/ZIP için anlamlı hedef sütun seçer."""
+    mode_hint = _MODE_TARGET_HINTS.get(data_mode_id)
+    if mode_hint and mode_hint in df.columns:
+        return mode_hint
+    if target_variable in df.columns:
+        return str(target_variable)
+    numeric, _ = DataLoader.infer_column_types(df)
+    candidates = [c for c in numeric if c not in _EXPORT_INDEX_SKIP]
+    if candidates:
+        return str(candidates[-1])
+    cols = list(df.columns.astype(str))
+    return cols[0] if cols else str(target_variable)
+
+
+def _export_safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Excel/ZIP dışa aktarımı için indeks ve datetime uyumluluğu sağlar."""
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+    if out.index.name or not isinstance(out.index, pd.RangeIndex):
+        out = out.reset_index()
+    return out
+
+
 def _default_target_column_index(columns: list[str]) -> int:
     """Hedef değişken için varsayılan selectbox indeksi."""
     lower_map = {str(c).lower(): i for i, c in enumerate(columns)}
@@ -443,6 +506,7 @@ def _run_analysis_pipeline(
     target_variable: str,
     pca_components_2d: int,
     pca_components_3d: int,
+    data_mode_id: str = "tabular",
 ) -> dict[str, Any]:
     """K-Means, PCA (2D+3D), anomali, dirsek ve RF önemlerini tek çağrıda çalıştırır."""
     labels: pd.Series | None = None
@@ -466,6 +530,9 @@ def _run_analysis_pipeline(
 
     engine = AIEngine()
     cols_arg = selected_numeric
+    deploy_target = _resolve_deploy_target(
+        analysis_df, str(target_variable), data_mode_id
+    )
 
     try:
         raw_labels, inertia_val, silhouette_val = engine.perform_clustering(
@@ -532,11 +599,11 @@ def _run_analysis_pipeline(
         except AIModelError as exc:
             err_importance = str(exc)
 
-    if target_variable and target_variable in analysis_df.columns:
+    if deploy_target and deploy_target in analysis_df.columns:
         try:
             target_imp_df = engine.target_feature_importance_rf(
                 analysis_df,
-                target_variable,
+                deploy_target,
                 numeric_columns=cols_arg,
             )
         except AIModelError as exc:
@@ -550,7 +617,7 @@ def _run_analysis_pipeline(
             n_clusters=int(n_clusters),
             contamination=float(contamination),
             numeric_columns=cols_arg,
-            target_column=str(target_variable),
+            target_column=str(deploy_target),
         )
         models_zip_bytes = _build_models_zip_bytes(bundle, app_version=CONFIG["VERSION"])
     except AIModelError as exc:
@@ -575,7 +642,7 @@ def _run_analysis_pipeline(
         "feature_columns": list(selected_numeric),
         "cluster_importance_df": cluster_imp_df,
         "err_importance": err_importance,
-        "target_column": str(target_variable),
+        "target_column": str(deploy_target),
         "target_importance_df": target_imp_df,
         "err_target_importance": err_target_importance,
         "models_zip_bytes": models_zip_bytes,
@@ -589,18 +656,23 @@ def _build_multi_sheet_excel_bytes(
 ) -> bytes:
     """3 sekmeli Excel: Cleaned Data, Anomalies, Summary (describe)."""
     buf = BytesIO()
-    cleaned = analysis_base.copy()
+    export_base = _export_safe_dataframe(analysis_base)
+    cleaned = export_base.copy()
     labels = result.get("labels")
     pred = result.get("pred")
     if labels is not None:
-        cleaned.insert(0, "Cluster_ID", np.asarray(labels).ravel())
+        lab = np.asarray(labels).ravel()
+        if len(lab) == len(cleaned):
+            cleaned.insert(0, "Cluster_ID", lab)
     if pred is not None:
-        cleaned["Anomaly_Label"] = np.asarray(pred).ravel()
+        pr = np.asarray(pred).ravel()
+        if len(pr) == len(cleaned):
+            cleaned["Anomaly_Label"] = pr
 
-    numeric_cols, _ = DataLoader.infer_column_types(analysis_base)
+    numeric_cols, _ = DataLoader.infer_column_types(export_base)
     if numeric_cols:
         summary = (
-            analysis_base[numeric_cols]
+            export_base[numeric_cols]
             .apply(pd.to_numeric, errors="coerce")
             .describe()
             .T
@@ -611,13 +683,124 @@ def _build_multi_sheet_excel_bytes(
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         cleaned.to_excel(writer, sheet_name="Cleaned Data", index=False)
         if pred is not None:
-            pred_s = pd.Series(np.asarray(pred).ravel(), index=analysis_base.index)
-            anomalies = cleaned.loc[pred_s == -1]
+            pr = np.asarray(pred).ravel()
+            if len(pr) == len(cleaned):
+                anomalies = cleaned.iloc[np.where(pr == -1)[0]]
+            else:
+                anomalies = cleaned.head(0)
         else:
             anomalies = cleaned.head(0)
         anomalies.to_excel(writer, sheet_name="Anomalies", index=False)
         summary.to_excel(writer, sheet_name="Summary", index=True)
     return buf.getvalue()
+
+
+def _strip_md_for_pdf(text: str) -> str:
+    """PDF metni için basit Markdown sadeleştirme."""
+    import re
+
+    out = str(text)
+    out = re.sub(r"\*\*([^*]+)\*\*", r"\1", out)
+    out = re.sub(r"^#+\s*", "", out, flags=re.MULTILINE)
+    out = out.replace("## ", "").replace("### ", "")
+    return out.strip()
+
+
+def _pdf_text(text: str) -> str:
+    """Helvetica uyumu için Türkçe karakterleri güvenli ASCII'ye indirger."""
+    return str(text).encode("latin-1", "replace").decode("latin-1")
+
+
+def _build_executive_summary_pdf_bytes(
+    result: dict[str, Any],
+    *,
+    app_version: str,
+    n_obs: int,
+    n_clusters: int,
+    strategy_md: str,
+    feat_cols: list[str],
+) -> bytes:
+    """Tek sayfalık yönetici özeti PDF (fpdf2)."""
+    from fpdf import FPDF
+
+    labels = result.get("labels")
+    pred = result.get("pred")
+    cluster_lines: list[str] = ["K-Means kume dagilimi:"]
+    if labels is not None:
+        counts = (
+            pd.Series(np.asarray(labels).ravel())
+            .value_counts()
+            .sort_index()
+        )
+        for cid, cnt in counts.items():
+            pct = 100.0 * float(cnt) / max(1, n_obs)
+            cluster_lines.append(f"  - Küme {cid}: {int(cnt)} gözlem (%{pct:.1f})")
+    else:
+        cluster_lines.append("  (Kümeleme sonucu yok)")
+
+    n_anom = 0
+    if pred is not None:
+        n_anom = int((np.asarray(pred).ravel() == -1).sum())
+
+    sil = result.get("silhouette")
+    pv = result.get("pca_variance_pct")
+    strategy_plain = _strip_md_for_pdf(strategy_md)
+
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=14)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 15)
+    epw_title = float(pdf.epw)
+    pdf.cell(
+        epw_title,
+        9,
+        _pdf_text(f"AI Visualizer - Yonetici Ozeti v{app_version}"),
+        ln=True,
+    )
+    pdf.set_font("Helvetica", size=10)
+    pdf.ln(2)
+    epw = float(pdf.epw)
+    pdf.multi_cell(epw, 5, _pdf_text(f"Gozlem sayisi: {n_obs}  |  k: {n_clusters}"))
+    pdf.multi_cell(
+        epw,
+        5,
+        _pdf_text(
+            f"Silhouette: {float(sil):.3f}" if sil is not None else "Silhouette: -"
+        ),
+    )
+    pdf.multi_cell(
+        epw,
+        5,
+        _pdf_text(
+            f"PCA PC1+PC2 varyans: %{float(pv):.1f}"
+            if pv is not None
+            else "PCA varyans: -"
+        ),
+    )
+    pdf.multi_cell(epw, 5, _pdf_text(f"Tespit edilen anomali: {n_anom}"))
+    pdf.multi_cell(
+        epw,
+        5,
+        _pdf_text(
+            "Ozellikler: " + ", ".join(feat_cols[:8])
+            + (" ..." if len(feat_cols) > 8 else "")
+        ),
+    )
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(epw, 6, _pdf_text("Kume dagilimi"), ln=True)
+    pdf.set_font("Helvetica", size=10)
+    for line in cluster_lines:
+        pdf.multi_cell(epw, 5, _pdf_text(line))
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(epw, 6, _pdf_text("AI Stratejik Tavsiyeler"), ln=True)
+    pdf.set_font("Helvetica", size=10)
+    for para in strategy_plain.split("\n"):
+        if para.strip():
+            pdf.multi_cell(epw, 5, _pdf_text(para.strip()))
+    raw_out = pdf.output()
+    return raw_out if isinstance(raw_out, bytes) else bytes(raw_out)
 
 
 def _build_models_zip_bytes(
@@ -1060,6 +1243,35 @@ def _render_plotly_interactive(
         )
 
 
+def _render_decision_banner(markdown_text: str) -> None:
+    """Akıllı grafik seçim gerekçesini grafik üstünde gösterir."""
+    st.markdown(
+        f'<div class="wv-decision-banner">{markdown_text}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_filter_impact_summary(
+    full_df: pd.DataFrame,
+    filtered_df: pd.DataFrame,
+) -> None:
+    """Sidebar filtre alanı altında veri yapısı ve filtre oranı özetini gösterir."""
+    n_full = max(1, len(full_df))
+    n_filt = len(filtered_df)
+    pct_filtered = max(0.0, min(100.0, (1.0 - n_filt / n_full) * 100.0))
+    n_continuous, n_categorical = count_structure_variables(filtered_df)
+    st.markdown(
+        (
+            '<div class="wv-filter-impact">'
+            f"Şu an toplam verinin <strong>%{pct_filtered:.1f}</strong> kadarı filtrelendi. "
+            f"Filtreleme sonrası sürekli değişken sayısı: <strong>{n_continuous}</strong>, "
+            f"Kategorik değişken sayısı: <strong>{n_categorical}</strong>."
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def _render_plotly_static(fig: Any, *, key: str | None = None) -> None:
     """Isı haritası, dirsek, histogram: araç çubuğu + yakınlaştırma; seçim tablosu yok."""
     cfg = CONFIG["PLOTLY"]["CHART_CONFIG"]
@@ -1171,6 +1383,37 @@ def _inject_premium_enterprise_css() -> None:
         button[data-baseweb="tab"] {
             border-radius: 8px 8px 0 0;
             transition: background 0.15s ease;
+        }
+
+        /* Akıllı karar bandı — grafik üstü bilgi şeridi */
+        .wv-decision-banner {
+            background: linear-gradient(
+                90deg,
+                rgba(79, 70, 229, 0.1) 0%,
+                rgba(14, 165, 233, 0.08) 100%
+            );
+            border-left: 4px solid rgba(79, 70, 229, 0.55);
+            border-radius: 10px;
+            padding: 10px 14px;
+            margin: 6px 0 12px 0;
+            font-size: 0.92rem;
+            line-height: 1.45;
+            color: var(--text-color);
+        }
+
+        /* Sidebar filtre etkisi özeti */
+        .wv-filter-impact {
+            background: var(--secondary-background-color);
+            border: 1px solid rgba(14, 165, 233, 0.18);
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin: 4px 0 10px 0;
+            font-size: 0.82rem;
+            line-height: 1.4;
+            color: var(--text-color);
+        }
+        .wv-filter-impact strong {
+            color: rgba(79, 70, 229, 0.95);
         }
         </style>
         """,
@@ -1290,8 +1533,9 @@ def _build_ai_strategy_advice_md(
             )
     if data_mode_id == "image_features" and n_obs > 0:
         bullets.append(
-            "Görsel benzerlik kümeleri tutarlı görünüyor; **otomatik etiketleme** veya "
-            "görüntü arşiv segmentasyonu değerlendirilebilir."
+            "Kan hücresi morfometrisinde kümeler ayrışmış görünüyor; **anormal hücre** "
+            "adayları irregularity_score ve nucleus_density ile klinik ön tarama "
+            "iş akışına alınabilir."
         )
     pv = result.get("pca_variance_pct")
     if pv is not None and float(pv) < float(thr["PCA_LOW_VARIANCE_PCT"]):
@@ -1480,6 +1724,396 @@ def _build_academic_report_markdown(
     return "\n".join(parts)
 
 
+def _compute_system_health_score(
+    qm: dict[str, Any],
+    result: dict[str, Any] | None,
+) -> float:
+    """Kayıp veri doluluğu ve anomali oranından 0–100 sistem sağlığı skoru."""
+    fill_pct = float(qm.get("pct_filled", 100.0))
+    anomaly_pct = 0.0
+    if result is not None:
+        pred = result.get("pred")
+        if pred is not None:
+            p = np.asarray(pred).ravel()
+            if len(p) > 0:
+                anomaly_pct = 100.0 * float((p == -1).sum()) / float(len(p))
+    score = 0.55 * fill_pct + 0.45 * max(0.0, 100.0 - anomaly_pct)
+    return float(max(0.0, min(100.0, score)))
+
+
+def _dominant_cluster_info(labels: pd.Series | None) -> tuple[str, str | None]:
+    """En kalabalık küme adı ve delta metni."""
+    if labels is None or len(labels) == 0:
+        return "—", None
+    vc = labels.astype(int).value_counts().sort_index()
+    dom = int(vc.idxmax())
+    count = int(vc.loc[dom])
+    pct = 100.0 * count / max(1, len(labels))
+    delta = f"%{pct:.0f} pay"
+    return f"Küme {dom}", delta
+
+
+def _top_target_correlation_info(
+    target_imp_df: pd.DataFrame | None,
+) -> tuple[str, str | None]:
+    """Hedefi en çok etkileyen özellik adı ve etki yüzdesi."""
+    if not isinstance(target_imp_df, pd.DataFrame) or target_imp_df.empty:
+        return "—", None
+    feat_col = str(target_imp_df.columns[0])
+    imp_col = str(target_imp_df.columns[1])
+    top = target_imp_df.sort_values(imp_col, ascending=False).iloc[0]
+    name = str(top[feat_col])
+    pct = float(top[imp_col]) * 100.0
+    return name, f"%{pct:.1f} etki"
+
+
+def _primary_imputation_method_label(
+    raw_df: pd.DataFrame,
+    cleaned_df: pd.DataFrame | None,
+) -> str:
+    """Temizlemede baskın imputation yöntemi (Ortalama / Moda / Medyan)."""
+    if cleaned_df is None:
+        return "Ortalama"
+    numeric_cols, cat_cols = DataLoader.infer_column_types(raw_df)
+    counts = {"Ortalama": 0, "Moda": 0, "Medyan": 0}
+    for col in numeric_cols:
+        if col not in raw_df.columns or col not in cleaned_df.columns:
+            continue
+        counts["Ortalama"] += int((raw_df[col].isna() & cleaned_df[col].notna()).sum())
+    for col in cat_cols:
+        if col not in raw_df.columns or col not in cleaned_df.columns:
+            continue
+        n_imp = int((raw_df[col].isna() & cleaned_df[col].notna()).sum())
+        if pd.api.types.is_datetime64_any_dtype(raw_df[col]):
+            counts["Medyan"] += n_imp
+        else:
+            counts["Moda"] += n_imp
+    best = max(counts, key=lambda k: counts[k])
+    if counts[best] <= 0:
+        return "Ortalama"
+    used = [k for k, v in counts.items() if v > 0]
+    if len(used) == 1:
+        return used[0]
+    return " / ".join(used)
+
+
+def _render_executive_kpi_row(
+    *,
+    n_obs: int,
+    n_base: int,
+    health_score: float,
+    dominant_cluster: str,
+    cluster_delta: str | None,
+    top_feature: str,
+    feature_delta: str | None,
+) -> None:
+    """Analiz ekranı üstü dört Executive KPI kartı."""
+    obs_delta = n_obs - n_base
+    delta_obs: str | int | None = obs_delta if obs_delta != 0 else None
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric(
+            "Toplam Gözlem Sayısı",
+            f"{n_obs:,}",
+            delta=delta_obs,
+            help="Filtre sonrası analize giren satır; delta, filtre öncesi tabloya göre fark.",
+        )
+    with k2:
+        st.metric(
+            "Sistem Sağlığı Skoru",
+            f"{health_score:.0f}/100",
+            help="Doluluk oranı (%55) ve anomali azlığı (%45) birleşik göstergesi.",
+        )
+    with k3:
+        st.metric(
+            "Baskın Küme",
+            dominant_cluster,
+            delta=cluster_delta,
+            help="En çok gözlemi barındıran K-Means kümesi.",
+        )
+    with k4:
+        st.metric(
+            "Hedef Korelasyonu",
+            top_feature,
+            delta=feature_delta,
+            help="Random Forest özellik öneminde hedefi en çok açıklayan sütun.",
+        )
+
+
+def _normalize_turkish_query(text: str) -> str:
+    """Regex eşleştirme için basit Türkçe karakter normalizasyonu."""
+    repl = str.maketrans(
+        "çğıöşüÇĞİÖŞÜ",
+        "cgiosucgiosu",
+    )
+    return text.translate(repl).lower().strip()
+
+
+def _answer_data_question(
+    query: str,
+    *,
+    result: dict[str, Any] | None,
+    analysis_df: pd.DataFrame,
+    analysis_base: pd.DataFrame,
+    target_col: str,
+    qm: dict[str, Any] | None,
+    n_clusters: int,
+) -> str | None:
+    """Doğal dil veri Q&A simülatörü (kural + regex tabanlı)."""
+    q = _normalize_turkish_query(query)
+    if not q:
+        return None
+
+    labels = result.get("labels") if result else None
+    pred = result.get("pred") if result else None
+
+    if result is None:
+        if re.search(r"(kac|kadar|sayi|satir|gozlem)", q):
+            return (
+                f"Şu an **{len(analysis_df):,}** gözlem yüklü. Küme ve anomali yanıtları için "
+                "**Analizi Çalıştır** düğmesine basın."
+            )
+        return (
+            "Henüz model çıktısı yok. Analizi çalıştırdıktan sonra küme, anomali ve hedef "
+            "sorularını yanıtlayabilirim."
+        )
+
+    if re.search(r"(en yuksek|en buyuk|baskin|dominant|kalabalik)", q) and re.search(
+        r"kume", q
+    ):
+        if labels is None:
+            return "Küme etiketleri üretilemedi; analiz hatasını kontrol edin."
+        vc = labels.astype(int).value_counts()
+        dom = int(vc.idxmax())
+        return (
+            f"En yüksek değerli küme **Küme {dom}**; toplam **{int(vc[dom]):,}** gözlem "
+            f"(**%{100.0 * vc[dom] / len(labels):.1f}** pay). "
+            f"Silhouette: **{result.get('silhouette', '—')}**."
+        )
+
+    if re.search(r"ortalama|mean|medyan", q):
+        num_cols, _ = DataLoader.infer_column_types(analysis_base)
+        if not num_cols:
+            return "Sayısal sütun bulunamadı; ortalama hesaplanamadı."
+        col = num_cols[0]
+        for c in num_cols:
+            if c.lower() in q or _normalize_turkish_query(c) in q:
+                col = c
+                break
+        s = pd.to_numeric(analysis_base[col], errors="coerce").dropna()
+        if s.empty:
+            return f"**{col}** sütununda yeterli sayısal veri yok."
+        return (
+            f"**{col}** için örnek ortalama **{float(s.mean()):.4g}**, "
+            f"medyan **{float(s.median()):.4g}** "
+            f"({len(s):,} gözlem)."
+        )
+
+    if re.search(r"anomali|aykiri|outlier", q):
+        if pred is None:
+            return "Anomali modeli çalıştırılamadı."
+        p = np.asarray(pred).ravel()
+        n_an = int((p == -1).sum())
+        return (
+            f"Isolation Forest **{n_an}** anomali işaretledi "
+            f"(toplam **{len(p):,}** gözlemin **%{100.0 * n_an / len(p):.1f}**'i)."
+        )
+
+    if re.search(r"silhouette|ayrisma|ayrism", q):
+        sil = result.get("silhouette")
+        if sil is None:
+            return "Silhouette skoru hesaplanamadı."
+        return (
+            f"Silhouette skoru **{float(sil):.3f}** "
+            f"({int(result.get('n_clusters', n_clusters))} küme). "
+            "−1…1 aralığında; yüksek değer daha net segmentasyonu destekler."
+        )
+
+    if re.search(r"hedef|onem|etki|korelasyon|feature", q):
+        imp = result.get("target_importance_df")
+        name, delta = _top_target_correlation_info(
+            imp if isinstance(imp, pd.DataFrame) else None
+        )
+        if name == "—":
+            return f"**{target_col}** için özellik önemi tablosu üretilemedi."
+        return (
+            f"**{target_col}** hedefini en çok etkileyen sütun **{name}** "
+            f"({delta or 'etki bilinmiyor'})."
+        )
+
+    if re.search(r"saglik|kalite|skor", q):
+        if qm is None:
+            return "Veri kalitesi metrikleri henüz hesaplanmadı."
+        hs = _compute_system_health_score(qm, result)
+        return (
+            f"Sistem sağlığı skoru **{hs:.0f}/100**. "
+            f"Ham doluluk **%{float(qm.get('pct_filled', 0)):.1f}**, "
+            f"eksiklik **%{float(qm.get('pct_missing', 0)):.1f}**."
+        )
+
+    if re.search(r"kume", q):
+        if labels is None:
+            return "Küme bilgisi yok."
+        vc = labels.astype(int).value_counts().sort_index()
+        parts = [f"Küme {int(k)}: {int(v)} gözlem" for k, v in vc.items()]
+        return "K-Means dağılımı — " + "; ".join(parts) + "."
+
+    return (
+        "Sorunuzu tam eşleştiremedim. Şunları deneyin: "
+        "'En yüksek küme hangisi?', 'Anomali sayısı?', 'Silhouette skoru?', "
+        "'Hedef önemi?' veya 'Ortalama değer?'."
+    )
+
+
+def _render_data_qa_bar(
+    *,
+    result: dict[str, Any] | None,
+    analysis_df: pd.DataFrame,
+    analysis_base: pd.DataFrame,
+    target_col: str,
+    qm: dict[str, Any] | None,
+    n_clusters: int,
+    ui: dict[str, Any],
+) -> None:
+    """Dashboard üstü doğal dil veri sorgu alanı."""
+    st.markdown("#### 💬 Veri Asistanı (Q&A)")
+    question = st.text_input(
+        ui.get("DATA_QA_PLACEHOLDER", "Verinize soru sorun"),
+        key="wv_data_qa_input",
+        placeholder=ui.get("DATA_QA_HINT", ""),
+    )
+    if question.strip():
+        answer = _answer_data_question(
+            question,
+            result=result,
+            analysis_df=analysis_df,
+            analysis_base=analysis_base,
+            target_col=target_col,
+            qm=qm,
+            n_clusters=n_clusters,
+        )
+        if answer:
+            st.success(answer)
+
+
+def _inject_zen_mode_css(*, full: bool = True) -> None:
+    """Jüri sunum modu: sidebar ve kalabalık UI öğelerini gizler / soluklaştırır."""
+    hide_sidebar = (
+        "section[data-testid='stSidebar'] { display: none !important; }"
+        if full
+        else ""
+    )
+    st.markdown(
+        f"""
+        <style>
+        {hide_sidebar}
+        .main .block-container {{
+            padding-top: 1.5rem;
+            max-width: 100%;
+        }}
+        .wv-zen-dim {{
+            opacity: 0.12 !important;
+            pointer-events: none !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        div[data-testid="stTabs"] {{
+            opacity: 0.08;
+            pointer-events: none;
+            max-height: 2.5rem;
+            overflow: hidden;
+        }}
+        .wv-jury-stage {{
+            background: linear-gradient(
+                180deg,
+                rgba(79, 70, 229, 0.06) 0%,
+                transparent 35%
+            );
+            border-radius: 16px;
+            padding: 8px 4px 24px 4px;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_jury_presentation_view(
+    result: dict[str, Any],
+    *,
+    analysis_df: pd.DataFrame,
+    analysis_base: pd.DataFrame,
+    feat_cols: list[str],
+    target_col: str,
+    n_clusters: int,
+    dm_sess: str,
+) -> None:
+    """Jüri modu: 3D PCA, karar bandı ve stratejik AI yorumları."""
+    viz = DataVisualizer(theme=_streamlit_theme())
+    labels = result.get("labels")
+    st.markdown('<div class="wv-jury-stage">', unsafe_allow_html=True)
+    st.markdown("# 🎬 Jüri Sunum Görünümü")
+    st.caption("Odak: 3D segmentasyon, akıllı karar matrisi ve stratejik öneriler.")
+
+    pca_3d = result.get("pca_coords_3d")
+    if pca_3d is not None and labels is not None:
+        st.markdown("### 3D PCA Explorer")
+        try:
+            pca3_enriched = pca_3d.join(analysis_df, how="left")
+            pv3 = result.get("pca_variance_pct_3d")
+            fig_3d = viz.plot_3d_pca_clusters(
+                pca3_enriched,
+                labels.values,
+                variance_explained_pct=float(pv3) if pv3 is not None else None,
+                chart_height=860,
+            )
+            _render_plotly_static(fig_3d, key="wv_jury_plot_pca_3d")
+            if pv3 is not None:
+                _render_ai_comment(
+                    f"PC1+PC2+PC3 ile açıklanan varyans **%{float(pv3):.1f}** "
+                    "(ölçeklenmiş uzay)."
+                )
+        except ValueError as exc:
+            st.warning(str(exc))
+    else:
+        st.info("3D PCA için analiz sonuçları eksik.")
+
+    smart_cols = list(feat_cols) if feat_cols else list(analysis_base.columns.astype(str))
+    if len(smart_cols) >= 2:
+        st.markdown("### Akıllı Karar Matrisi")
+        sa, sb = smart_cols[0], smart_cols[1]
+        try:
+            fig_smart, smart_kind, smart_comment = viz.plot_smart_bivariate(
+                analysis_base,
+                sa,
+                sb,
+            )
+            _render_decision_banner(
+                build_bivariate_decision_banner(analysis_base, sa, sb, smart_kind)
+            )
+            _render_plotly_static(fig_smart, key="wv_jury_plot_smart")
+            _render_ai_comment(smart_comment)
+        except ValueError as exc:
+            st.warning(str(exc))
+
+    st.markdown(
+        CONFIG.get("UI", {}).get(
+            "REPORT_STRATEGY_SECTION_MD",
+            "## 🤖 AI Stratejik Tavsiyeler",
+        )
+    )
+    st.markdown(
+        _build_ai_strategy_advice_md(
+            result,
+            len(analysis_df),
+            data_mode_id=_data_mode_id(dm_sess),
+        )
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 def main() -> None:
     ui = CONFIG["UI"]
     model = CONFIG["MODEL"]
@@ -1614,9 +2248,9 @@ def main() -> None:
         )
         if mode_load == "image_features":
             st.caption(
-                "Sunum notu: Gerçek projede bu verileri **evrişimli sinir ağları (CNN)** "
-                "veya **OpenCV** ile çıkarıp sistemimize besliyoruz; burada 100 görsel satırı "
-                "**simüle** edilmiştir."
+                "HealthTech modu: mikroskopi görüntülerinden çıkarılan **hücre çapı**, "
+                "**çekirdek yoğunluğu** ve **şekil bozukluğu** özellikleri ile sağlıklı / "
+                "anormal hücre kümelemesi simüle edilir."
             )
     elif st.session_state.get(demo_key):
         try:
@@ -1738,6 +2372,7 @@ def main() -> None:
             cat_filters=cat_filters,
             numeric_ranges=numeric_ranges,
         )
+        _render_filter_impact_summary(analysis_base, filtered_preview)
         n_rows_model = len(filtered_preview)
         max_k = max(1, n_rows_model - 1) if n_rows_model > 1 else 1
         default_k = min(int(model["DEFAULT_K_MEANS_CAP"]), max_k)
@@ -1867,6 +2502,13 @@ def main() -> None:
             help=ui.get("CHECKBOX_ACADEMIC_TIPS_HELP", ""),
         )
 
+        jury_mode = st.toggle(
+            ui.get("JURY_MODE_LABEL", "🎬 Jüri Sunum Modu"),
+            value=False,
+            key="wv_jury_presentation_mode",
+            help=ui.get("JURY_MODE_HELP", ""),
+        )
+
         st.divider()
         st.caption(CONFIG["VISION_NOTE"])
         if st.button(
@@ -1937,6 +2579,52 @@ def main() -> None:
         st.session_state.pop("analiz_result", None)
     st.session_state["_feature_selection_key"] = feature_selection_key
 
+    jury_mode = bool(st.session_state.get("wv_jury_presentation_mode", False))
+    result_early: dict[str, Any] | None = st.session_state.get("analiz_result")
+    qm_dashboard: dict[str, Any] | None = None
+    try:
+        qm_dashboard = DataLoader.compute_fill_quality_metrics(df, cleaned)
+    except (PreprocessingError, ValueError, KeyError, TypeError):
+        qm_dashboard = None
+
+    _render_data_qa_bar(
+        result=result_early,
+        analysis_df=analysis_df,
+        analysis_base=analysis_base,
+        target_col=str(target_variable),
+        qm=qm_dashboard,
+        n_clusters=int(n_clusters),
+        ui=ui,
+    )
+
+    if jury_mode and result_early is not None:
+        _inject_zen_mode_css(full=True)
+        feat_for_jury = list(
+            result_early.get("feature_columns") or selected_numeric or numeric_for_model
+        )
+        _render_jury_presentation_view(
+            result_early,
+            analysis_df=analysis_df,
+            analysis_base=analysis_base,
+            feat_cols=feat_for_jury,
+            target_col=str(
+                result_early.get("target_column") or target_variable or ""
+            ),
+            n_clusters=int(n_clusters),
+            dm_sess=dm_sess,
+        )
+        st.divider()
+        footer_j = ui.get("FOOTER_TEXT")
+        if footer_j:
+            st.caption(footer_j)
+        return
+
+    if jury_mode:
+        st.info(
+            "🎬 Jüri Sunum Modu açık — sunum görünümü için **Analiz Paneli** sekmesinde "
+            "analizi çalıştırın; ardından odaklı slayt düzeni otomatik açılır."
+        )
+
     tab_icons = ui.get("TAB_ICONS") or []
     tab_labels_base = list(ui["TABS"])
     if len(tab_icons) == len(tab_labels_base):
@@ -1967,6 +2655,28 @@ def main() -> None:
             _render_plotly_static(fig_prev, key="wv_plot_quality_radar_raw")
         except (PreprocessingError, ValueError, KeyError, TypeError):
             st.caption("Kalite radarı bu veri için hesaplanamadı.")
+        st.markdown("#### Veri Sağlığı Haritası")
+        st.caption(
+            "Kırmızı hücreler eksik (NaN) değerleri gösterir; temizleme öncesi ham veri "
+            "yapısının röntgenidir."
+        )
+        try:
+            imput_lbl = _primary_imputation_method_label(df, cleaned)
+            fig_miss = DataVisualizer(theme=_streamlit_theme()).plot_missing_data_matrix(
+                df,
+                max_rows=120,
+                title="Kayıp veri matrisi (NaN ısı haritası)",
+            )
+            _render_plotly_static(fig_miss, key="wv_plot_missing_matrix")
+            _render_ai_comment(
+                StatisticalCommentator.missing_data_repair(
+                    df,
+                    cleaned,
+                    method_label=imput_lbl,
+                )
+            )
+        except (ValueError, PreprocessingError, KeyError, TypeError) as exc:
+            st.caption(f"Veri sağlığı haritası oluşturulamadı: {exc}")
         st.dataframe(
             df.head(int(prev["RAW_CLEAN_HEAD"])),
             use_container_width=True,
@@ -2096,6 +2806,7 @@ def main() -> None:
                     target_variable=str(target_variable),
                     pca_components_2d=int(model["PCA_COMPONENTS_UI"]),
                     pca_components_3d=int(model["PCA_COMPONENTS_3D"]),
+                    data_mode_id=_data_mode_id(dm_sess),
                 )
             st.session_state["analiz_result"] = {
                 **pipeline_out,
@@ -2126,6 +2837,32 @@ def main() -> None:
             viz = DataVisualizer(theme=_streamlit_theme())
             tips_cfg: dict[str, str] = CONFIG.get("PRESENTATION_TIPS", {})
             commentator = StatisticalCommentator()
+
+            qm_kpi = qm_dashboard
+            if qm_kpi is None:
+                try:
+                    qm_kpi = DataLoader.compute_fill_quality_metrics(df, cleaned)
+                except (PreprocessingError, ValueError, KeyError, TypeError):
+                    qm_kpi = {"pct_filled": 100.0, "pct_missing": 0.0}
+            labels_kpi = result.get("labels")
+            dom_cluster, dom_delta = _dominant_cluster_info(
+                labels_kpi if isinstance(labels_kpi, pd.Series) else None
+            )
+            top_feat, feat_delta = _top_target_correlation_info(
+                result.get("target_importance_df")
+                if isinstance(result.get("target_importance_df"), pd.DataFrame)
+                else None
+            )
+            _render_executive_kpi_row(
+                n_obs=len(analysis_df),
+                n_base=len(analysis_base),
+                health_score=_compute_system_health_score(qm_kpi, result),
+                dominant_cluster=dom_cluster,
+                cluster_delta=dom_delta,
+                top_feature=top_feat,
+                feature_delta=feat_delta,
+            )
+            st.divider()
 
             feat_cols = result.get("feature_columns") or selected_numeric
             target_col = str(
@@ -2200,14 +2937,18 @@ def main() -> None:
                                 smart_b,
                             )
                         )
+                        _render_decision_banner(
+                            build_bivariate_decision_banner(
+                                analysis_base,
+                                smart_a,
+                                smart_b,
+                                smart_kind,
+                            )
+                        )
                         _render_plotly_static(
                             fig_smart, key="wv_plot_smart_bivariate"
                         )
                         _render_ai_comment(smart_comment)
-                        st.caption(
-                            f"Seçilen grafik türü: **{smart_kind}** "
-                            f"({smart_a} × {smart_b})."
-                        )
                         _academic_tip_if(
                             show_academic_tips,
                             tips_cfg.get("smart_chart", ""),
@@ -2778,9 +3519,27 @@ def main() -> None:
             )
             try:
                 excel_bytes = _build_multi_sheet_excel_bytes(analysis_base, result)
-            except (ValueError, OSError, ImportError) as exc:
+            except (ValueError, OSError, ImportError, KeyError, TypeError) as exc:
                 excel_bytes = None
                 st.caption(f"Excel dışa aktarımı hazırlanamadı: {exc}")
+
+            strategy_md = _build_ai_strategy_advice_md(
+                result,
+                len(analysis_df),
+                data_mode_id=_data_mode_id(dm_sess),
+            )
+            try:
+                pdf_bytes = _build_executive_summary_pdf_bytes(
+                    result,
+                    app_version=str(CONFIG["VERSION"]),
+                    n_obs=len(analysis_df),
+                    n_clusters=int(n_clusters),
+                    strategy_md=strategy_md,
+                    feat_cols=list(feat_cols),
+                )
+            except (ImportError, OSError, ValueError, TypeError) as exc:
+                pdf_bytes = None
+                st.caption(f"PDF özeti hazırlanamadı: {exc}")
 
             models_zip = result.get("models_zip_bytes")
             dl1, dl2 = st.columns(2)
@@ -2855,9 +3614,24 @@ def main() -> None:
                     st.caption(f"Model ZIP: {result['err_models_zip']}")
                 else:
                     st.caption("Model ZIP henüz üretilmedi; analizi yeniden çalıştırın.")
+            if isinstance(pdf_bytes, bytes) and len(pdf_bytes) > 0:
+                st.download_button(
+                    label=ui["BTN_DOWNLOAD_PDF"],
+                    data=pdf_bytes,
+                    file_name=(
+                        f'{ui["PDF_FILENAME_PREFIX"]}_v{CONFIG["VERSION"]}.pdf'
+                    ),
+                    mime="application/pdf",
+                    help=(
+                        "Tek sayfalık yönetici özeti: küme dağılımı, metrikler ve "
+                        "AI stratejik tavsiyeler."
+                    ),
+                    use_container_width=True,
+                    key="wv_download_executive_pdf",
+                )
             st.caption(
-                "Kurumsal dışa aktarım: çok sayfalı Excel, şeffaf `.py` betiği ve "
-                "canlı ortama alınabilir `.zip` model paketi — kara kutu değildir."
+                "Kurumsal dışa aktarım: Excel (3 sekme), `.py` betiği, model `.zip` ve "
+                "yönetici PDF — multimodal modlarda güvenli dışa aktarım."
             )
             st.markdown(
                 CONFIG.get("UI", {}).get(
@@ -2865,13 +3639,7 @@ def main() -> None:
                     "## 🤖 AI Stratejik Tavsiyeler",
                 )
             )
-            st.markdown(
-                _build_ai_strategy_advice_md(
-                    result,
-                    len(analysis_df),
-                    data_mode_id=_data_mode_id(dm_sess),
-                )
-            )
+            st.markdown(strategy_md)
 
     with tab_exec:
         st.markdown("# Yönetici özeti")

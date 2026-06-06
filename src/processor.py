@@ -292,16 +292,16 @@ class DataLoader:
         name_hint: str = "",
     ) -> pd.DataFrame:
         """
-        Görüntü koleksiyonunu taklit eden sayısal özellik tablosu (OpenCV/CNN yok).
+        Kan hücresi mikroskopi analizini taklit eden sayısal özellik tablosu.
 
-        Parlaklık, kontrast, renk doygunluğu, kenar yoğunluğu ve tahmini nesne sayısı
-        üretilir; gerçek piksellerden çıkarım yerine savunma ve boru hattı gösterimi
-        içindir (OpenCV veya evrişimli ağ ile değiştirilebilir).
+        Gerçek piksel/CNN çıkarımı yerine HealthTech savunması için tutarlı sentetik
+        morfometrik vektörler üretilir; K-Means ile sağlıklı / anormal hücre
+        segmentasyonu demosu için tasarlanmıştır.
 
         Parameters
         ----------
         n_rows
-            Görüntü / örnek sayısı.
+            Hücre / örnek sayısı.
         seed
             RNG tohumu.
         name_hint
@@ -310,24 +310,41 @@ class DataLoader:
         Returns
         -------
         pd.DataFrame
-            ``brightness``, ``contrast``, ``color_saturation``, ``edge_density``,
-            ``object_count``.
+            ``cell_diameter_um``, ``nucleus_density``, ``color_intensity_red``,
+            ``irregularity_score`` sütunları.
         """
         n = max(5, min(5000, int(n_rows)))
         if seed is None:
             seed = abs(hash(name_hint)) % (2**31 - 1) if name_hint else 43
         rng = np.random.default_rng(int(seed))
-        idx = pd.RangeIndex(start=0, stop=n, name="image_id")
-        return pd.DataFrame(
-            {
-                "brightness": rng.uniform(0.08, 0.98, n),
-                "contrast": rng.uniform(0.12, 0.92, n),
-                "color_saturation": rng.uniform(0.0, 1.0, n),
-                "edge_density": rng.uniform(0.05, 0.95, n),
-                "object_count": rng.integers(1, 15, size=n).astype(np.float64),
-            },
-            index=idx,
-        )
+        n_healthy = max(1, int(n * 0.7))
+        n_abnormal = n - n_healthy
+
+        def _block(count: int, *, abnormal: bool) -> dict[str, np.ndarray]:
+            if abnormal:
+                return {
+                    "cell_diameter_um": rng.normal(16.5, 3.2, count).clip(6, 28),
+                    "nucleus_density": rng.normal(0.78, 0.12, count).clip(0.35, 1.0),
+                    "color_intensity_red": rng.normal(0.82, 0.14, count).clip(0.2, 1.0),
+                    "irregularity_score": rng.normal(0.62, 0.15, count).clip(0.25, 1.0),
+                }
+            return {
+                "cell_diameter_um": rng.normal(8.2, 1.1, count).clip(5, 14),
+                "nucleus_density": rng.normal(0.42, 0.08, count).clip(0.15, 0.75),
+                "color_intensity_red": rng.normal(0.55, 0.1, count).clip(0.25, 0.85),
+                "irregularity_score": rng.normal(0.18, 0.07, count).clip(0.02, 0.45),
+            }
+
+        h = _block(n_healthy, abnormal=False)
+        a = _block(n_abnormal, abnormal=True)
+        merged = {
+            k: np.concatenate([h[k], a[k]])
+            for k in h
+        }
+        df = pd.DataFrame(merged)
+        df = df.sample(frac=1.0, random_state=int(seed)).reset_index(drop=True)
+        df.insert(0, "cell_id", np.arange(n, dtype=int))
+        return df
 
     @staticmethod
     def infer_column_types(df: pd.DataFrame) -> tuple[list[str], list[str]]:
