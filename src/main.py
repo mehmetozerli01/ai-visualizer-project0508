@@ -36,14 +36,14 @@ from visualizer import (
 
 # --- Merkezi ayarlar (bakım / tema / varsayılanlar) -----------------------------
 CONFIG: dict[str, Any] = {
-    "VERSION": "1.2.0",
+    "VERSION": "1.2.5",
     "UI": {
         "PAGE_TITLE": "AI Visualizer",
         "PAGE_LAYOUT": "wide",
-        "APP_TITLE": "AI Visualizer — Fortune 500 BI Dashboard v1.2.0",
+        "APP_TITLE": "AI Visualizer — Observability & BI Dashboard v1.2.5",
         "APP_CAPTION": (
-            "Executive KPI kartları, veri sağlığı ısı haritası, doğal dil Q&A "
-            "asistanı ve jüri sunum modu."
+            "Execution profiler, otomatik veri sözlüğü, Streamlit önbellekleme ve "
+            "Fortune 500 BI deneyimi."
         ),
         "FILE_UPLOADER_LABEL": "CSV / Excel dosyası",
         "FILE_EXTENSIONS": ["csv", "xlsx", "xlsm"],
@@ -83,8 +83,8 @@ CONFIG: dict[str, Any] = {
         "REPORT_PREVIEW_EXPANDER": "📄 İndirilecek rapor önizlemesi",
         "REPORT_STRATEGY_SECTION_MD": "## 🤖 AI Stratejik Tavsiyeler",
         "FOOTER_TEXT": (
-            "v1.2.0 | Mehmet Özerli — Executive BI dashboard, veri sağlığı haritası, "
-            "AI Q&A ve jüri sunum modu"
+            "v1.2.5 | Mehmet Özerli — execution profiler, data catalog, Streamlit cache "
+            "(code freeze)"
         ),
         "DATA_QA_PLACEHOLDER": "🔍 Verinize Soru Sorun (Örn: En yüksek değerli küme hangisi?)",
         "DATA_QA_HINT": (
@@ -125,8 +125,38 @@ CONFIG: dict[str, Any] = {
         "MIN_NUMERIC_FEATURES": 2,
     },
     "PREVIEW": {
-        "RAW_CLEAN_HEAD": 50,
+        "RAW_CLEAN_HEAD": 100,
         "ANALYSIS_TABLE_HEAD": 100,
+    },
+    "GUI": {
+        "PREVIEW_MAX_ROWS": 100,
+        "PREVIEW_CAPTION": (
+            "⚡ Performans Optimizasyonu: Tarayıcı belleğini korumak amacıyla "
+            "önizlemede sadece ilk 100 satır gösterilmektedir. Analizler tüm veri "
+            "seti üzerinde çalışmaktadır."
+        ),
+        "WHATIF_EDITOR_CAPTION": (
+            "⚡ What-If editörü: tarayıcı performansı için yalnızca ilk 100 satır "
+            "düzenlenebilir; analizler tam veri seti üzerinde çalışır."
+        ),
+        "CACHE_SPINNER": "Veri belleğe alınıyor...",
+        "MAX_CATEGORY_FILTER_OPTIONS": 40,
+        "LAZY_TAB_ROW_THRESHOLD": 400,
+        "WHATIF_EDITOR_MAX_ROWS": 100,
+        "LARGE_DATA_MODE_CAPTION": (
+            "⚡ Büyük veri modu: yalnızca seçili sekme yüklenir; yüksek kardinaliteli "
+            "sütunlar filtre dışı bırakıldı."
+        ),
+        "PLOT_MAX_POINTS": 250,
+        "HEAVY_CHARTS_TOGGLE": "📊 Detaylı grafikleri yükle (1000+ satır)",
+        "HEAVY_CHARTS_HELP": (
+            "KPI ve hedef önemi hemen gösterilir. Küme/PCA/anomali grafikleri "
+            "isteğe bağlıdır; açıldığında noktalar örneklenir."
+        ),
+        "PLOT_SAMPLE_CAPTION": (
+            "⚡ Performans: grafikte {shown}/{total} gözlem (rastgele örnek). "
+            "Analiz tam veri seti üzerinde çalıştı."
+        ),
     },
     "FORMATTING": {
         "TABLE_FLOAT_DECIMALS": 2,
@@ -533,6 +563,7 @@ def _run_analysis_pipeline(
     deploy_target = _resolve_deploy_target(
         analysis_df, str(target_variable), data_mode_id
     )
+    execution_timings: dict[str, float] = {}
 
     try:
         raw_labels, inertia_val, silhouette_val = engine.perform_clustering(
@@ -623,6 +654,8 @@ def _run_analysis_pipeline(
     except AIModelError as exc:
         err_models_zip = str(exc)
 
+    execution_timings = engine.execution_timings
+
     return {
         "labels": labels,
         "pca_coords": pca_coords,
@@ -647,6 +680,7 @@ def _run_analysis_pipeline(
         "err_target_importance": err_target_importance,
         "models_zip_bytes": models_zip_bytes,
         "err_models_zip": err_models_zip,
+        "execution_timings": execution_timings,
     }
 
 
@@ -1091,6 +1125,248 @@ def _load_demo_dataset(name: str) -> pd.DataFrame:
     return _load_sklearn_demo(name)
 
 
+class _NamedBytesIO(BytesIO):
+    """DataLoader.load_file için isimli bellek akışı (önbellek dostu)."""
+
+    def __init__(self, data: bytes, name: str) -> None:
+        super().__init__(data)
+        self.name = name
+
+
+def _cache_spinner_label() -> str:
+    return str(CONFIG.get("GUI", {}).get("CACHE_SPINNER", "Veri belleğe alınıyor..."))
+
+
+def _gui_preview_limit() -> int:
+    return int(CONFIG.get("GUI", {}).get("PREVIEW_MAX_ROWS", 100))
+
+
+def _gui_preview_caption() -> str:
+    return str(
+        CONFIG.get("GUI", {}).get(
+            "PREVIEW_CAPTION",
+            "⚡ Performans: önizlemede ilk 100 satır; analiz tam veri üzerinde.",
+        )
+    )
+
+
+def _lazy_tab_row_threshold() -> int:
+    return int(CONFIG.get("GUI", {}).get("LAZY_TAB_ROW_THRESHOLD", 400))
+
+
+def _max_category_filter_options() -> int:
+    return int(CONFIG.get("GUI", {}).get("MAX_CATEGORY_FILTER_OPTIONS", 40))
+
+
+def _whatif_editor_max_rows() -> int:
+    return int(CONFIG.get("GUI", {}).get("WHATIF_EDITOR_MAX_ROWS", 100))
+
+
+def _is_large_dataset(df: pd.DataFrame) -> bool:
+    return len(df) >= _lazy_tab_row_threshold()
+
+
+def _plot_max_points() -> int:
+    return int(CONFIG.get("GUI", {}).get("PLOT_MAX_POINTS", 250))
+
+
+def _plot_sample_caption(shown: int, total: int) -> str:
+    tpl = str(
+        CONFIG.get("GUI", {}).get(
+            "PLOT_SAMPLE_CAPTION",
+            "⚡ Grafikte {shown}/{total} gözlem.",
+        )
+    )
+    return tpl.format(shown=shown, total=total)
+
+
+def _sample_for_visualization(
+    df: pd.DataFrame,
+    labels: np.ndarray | pd.Series | None = None,
+    *,
+    max_points: int | None = None,
+) -> tuple[pd.DataFrame, np.ndarray | None, bool]:
+    """Plotly için satır alt örneklemesi; (df, labels, was_sampled)."""
+    cap = int(max_points) if max_points is not None else _plot_max_points()
+    n = len(df)
+    if n <= cap:
+        if labels is None:
+            return df, None, False
+        return df, np.asarray(labels).ravel(), False
+    sub = df.sample(n=cap, random_state=42)
+    if labels is None:
+        return sub, None, True
+    lab = pd.Series(np.asarray(labels).ravel(), index=df.index).loc[sub.index]
+    return sub, lab.to_numpy(), True
+
+
+def _use_static_plotly_only(df: pd.DataFrame) -> bool:
+    """Etkileşimli seçimli grafikler büyük veride devre dışı."""
+    return len(df) > _plot_max_points()
+
+
+def _render_lite_cluster_summary(
+    result: dict[str, Any],
+    *,
+    n_clusters: int,
+    dec: int,
+    commentator: StatisticalCommentator,
+) -> None:
+    """Büyük veride grafik yüklemeden küme KPI özeti."""
+    labels = result.get("labels")
+    if labels is None:
+        return
+    st.markdown("### Kümeleme özeti (hızlı)")
+    c1, c2 = st.columns(2)
+    with c1:
+        if result.get("inertia") is not None:
+            st.metric("Inertia (WCSS)", f"{float(result['inertia']):.4f}")
+    with c2:
+        sil = result.get("silhouette")
+        if sil is not None:
+            st.metric("Silhouette", f"{float(sil):.3f}")
+    counts_df = (
+        pd.DataFrame({"cluster": labels.values})
+        .groupby("cluster", sort=True)
+        .size()
+        .reset_index(name="count")
+    )
+    st.dataframe(
+        _style_analysis_dataframe(counts_df, float_decimals=dec),
+        use_container_width=True,
+        hide_index=True,
+    )
+    _render_ai_comment(
+        commentator.silhouette(
+            result.get("silhouette"),
+            int(result.get("n_clusters", n_clusters)),
+        )
+    )
+    st.info(
+        "PCA, 3D küme ve anomali grafikleri için yukarıdaki "
+        "**Detaylı grafikleri yükle** anahtarını açın."
+    )
+
+
+def _render_dataframe_preview(
+    df: pd.DataFrame,
+    *,
+    use_container_width: bool = True,
+    hide_index: bool = False,
+    show_truncation_caption: bool = True,
+) -> None:
+    """Tarayıcı DOM yükünü sınırlayan güvenli tablo önizlemesi."""
+    limit = _gui_preview_limit()
+    st.dataframe(
+        df.head(limit),
+        use_container_width=use_container_width,
+        hide_index=hide_index,
+    )
+    if show_truncation_caption and len(df) > limit:
+        st.caption(_gui_preview_caption())
+
+
+def _render_styled_dataframe_preview(
+    df: pd.DataFrame,
+    *,
+    float_decimals: int,
+    use_container_width: bool = True,
+    hide_index: bool = False,
+) -> None:
+    """Stil uygulanmış analiz tabloları için satır sınırlı önizleme."""
+    limit = _gui_preview_limit()
+    preview = df.head(limit)
+    st.dataframe(
+        _style_analysis_dataframe(preview, float_decimals=float_decimals),
+        use_container_width=use_container_width,
+        hide_index=hide_index,
+    )
+    if len(df) > limit:
+        st.caption(_gui_preview_caption())
+
+
+def _whatif_editor_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """What-If editörü için satır sınırlı görünüm (büyük veri DOM koruması)."""
+    limit = _gui_preview_limit()
+    if len(df) > limit:
+        return df.iloc[:limit].copy(), True
+    return df.copy(), False
+
+
+def _merge_whatif_edits(full: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
+    """Önizleme editöründeki değişiklikleri tam veri çerçevesine yazar."""
+    merged = full.copy()
+    merged.loc[edited.index] = edited
+    return merged
+
+
+@st.cache_data(show_spinner=_cache_spinner_label())
+def _cached_load_file(file_name: str, raw_bytes: bytes) -> pd.DataFrame:
+    """Ham dosya baytlarını ayrıştırır; sekme/filtre rerun'larında önbellekten döner."""
+    return DataLoader.load_file(_NamedBytesIO(raw_bytes, file_name))
+
+
+@st.cache_data(show_spinner=_cache_spinner_label())
+def _cached_process_text_file(_fingerprint: str, raw_bytes: bytes) -> tuple[pd.DataFrame, str]:
+    """Metin derlemesi vektörleştirmesini önbelleğe alır."""
+    return DataLoader.process_text_file(raw_bytes)
+
+
+@st.cache_data(show_spinner=_cache_spinner_label())
+def _cached_clean_data(data_signature: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Eksik değer doldurma (imputation) adımını önbelleğe alır."""
+    return DataLoader.clean_data(df)
+
+
+@st.cache_data(show_spinner=_cache_spinner_label())
+def _cached_load_demo_dataset(demo_key: str) -> pd.DataFrame:
+    """Örnek sklearn/sentetik veri setlerini önbelleğe alır."""
+    return _load_demo_dataset(demo_key)
+
+
+def _build_data_dictionary_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Data Catalog tarzı sütun sözlüğü (ad, tip, nunique)."""
+    numeric_cols, categorical_cols = DataLoader.infer_column_types(df)
+    rows: list[dict[str, Any]] = []
+    for col in df.columns:
+        series = df[col]
+        if col in numeric_cols:
+            if pd.api.types.is_bool_dtype(series):
+                dtype_lbl = "bool"
+            elif pd.api.types.is_integer_dtype(series):
+                dtype_lbl = "int"
+            else:
+                dtype_lbl = "float"
+        elif col in categorical_cols:
+            dtype_lbl = "categorical"
+        else:
+            dtype_lbl = str(series.dtype)
+        rows.append(
+            {
+                "Sütun": str(col),
+                "Veri Tipi": dtype_lbl,
+                "Benzersiz (nunique)": int(series.nunique(dropna=True)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _format_pipeline_execution_caption(timings: dict[str, float] | None) -> str:
+    """Profiler çıktısını KPI altı caption metnine dönüştürür."""
+    if not timings:
+        return ""
+    parts: list[str] = []
+    kmeans_s = timings.get("kmeans")
+    if kmeans_s is not None and kmeans_s >= 0:
+        parts.append(f"K-Means ({kmeans_s:.2f}s)")
+    rf_s = float(timings.get("rf_target", 0.0)) + float(timings.get("rf_cluster", 0.0))
+    if rf_s > 0:
+        parts.append(f"RF ({rf_s:.2f}s)")
+    if not parts:
+        return ""
+    return "⏱️ Pipeline Execution Time: " + " | ".join(parts)
+
+
 def _cluster_profile_means(
     analysis_df: pd.DataFrame,
     labels: pd.Series,
@@ -1218,11 +1494,23 @@ def _render_plotly_interactive(
     selection_base: pd.DataFrame,
     float_decimals: int,
     show_selection_hint: bool = True,
+    force_static: bool = False,
 ) -> None:
     """Scatter vb. için lasso/kutu seçimi ve seçilen satır önizlemesi."""
     cfg = CONFIG["PLOTLY"]["CHART_CONFIG"]
+    if force_static or _use_static_plotly_only(selection_base):
+        _render_plotly_static(fig, key=key)
+        if len(selection_base) > _plot_max_points():
+            st.caption(
+                _plot_sample_caption(
+                    min(len(selection_base), _plot_max_points()),
+                    len(selection_base),
+                )
+            )
+        return
     if show_selection_hint:
         st.caption(CONFIG["PLOTLY"]["CAPTION_SELECTION"])
+    pick_base = selection_base.head(_gui_preview_limit())
     ps = st.plotly_chart(
         fig,
         use_container_width=True,
@@ -1231,15 +1519,12 @@ def _render_plotly_interactive(
         on_select="rerun",
         selection_mode=("lasso", "box"),
     )
-    picked = _resolve_plotly_selection_rows(ps, selection_base)
+    picked = _resolve_plotly_selection_rows(ps, pick_base)
     if picked is not None and not picked.empty:
         st.markdown(f"**Seçilen gözlemler** ({len(picked)} satır)")
-        st.dataframe(
-            _style_analysis_dataframe(
-                picked.head(200),
-                float_decimals=float_decimals,
-            ),
-            use_container_width=True,
+        _render_styled_dataframe_preview(
+            picked,
+            float_decimals=float_decimals,
         )
 
 
@@ -2182,13 +2467,15 @@ def main() -> None:
         st.session_state.pop(demo_key, None)
         try:
             if mode_load == "text_corpus":
-                raw_bytes = uploaded.read()
-                df, text_preview = DataLoader.process_text_file(raw_bytes)
-                st.session_state[sess["TEXT_CORPUS_BLOB"]] = text_preview
+                raw_bytes = uploaded.getvalue()
                 upload_fingerprint = (
                     f"text_corpus:{uploaded.name}:"
                     f"{getattr(uploaded, 'size', 0)}"
                 )
+                df, text_preview = _cached_process_text_file(
+                    upload_fingerprint, raw_bytes
+                )
+                st.session_state[sess["TEXT_CORPUS_BLOB"]] = text_preview
             elif mode_load == "audio_features":
                 st.session_state.pop(sess["TEXT_CORPUS_BLOB"], None)
                 name_l = (uploaded.name or "").lower()
@@ -2235,7 +2522,9 @@ def main() -> None:
                 )
             else:
                 st.session_state.pop(sess["TEXT_CORPUS_BLOB"], None)
-                df = loader.load_file(uploaded)
+                raw_bytes = uploaded.getvalue()
+                file_name = uploaded.name or "upload.csv"
+                df = _cached_load_file(file_name, raw_bytes)
                 upload_fingerprint = (
                     f"tabular:{uploaded.name}:"
                     f"{getattr(uploaded, 'size', 0)}"
@@ -2255,7 +2544,7 @@ def main() -> None:
     elif st.session_state.get(demo_key):
         try:
             dkey = str(st.session_state[demo_key])
-            df = _load_demo_dataset(dkey)
+            df = _cached_load_demo_dataset(dkey)
         except (ImportError, OSError, ValueError) as exc:
             st.error(f"Örnek veri yüklenemedi: {exc}")
             return
@@ -2283,7 +2572,7 @@ def main() -> None:
     cleaned: pd.DataFrame | None = None
     clean_error: str | None = None
     try:
-        cleaned = loader.clean_data(df)
+        cleaned = _cached_clean_data(upload_fingerprint, df)
     except PreprocessingError as exc:
         clean_error = str(exc)
 
@@ -2323,16 +2612,33 @@ def main() -> None:
                 if len(selected_numeric) < int(model["MIN_NUMERIC_FEATURES"]):
                     st.caption(msg["CAPTION_PICK_TWO_COLUMNS"])
 
-        with st.expander("🔎 Veri Filtresi", expanded=True):
+        _large_data = _is_large_dataset(analysis_base)
+        with st.expander("🔎 Veri Filtresi", expanded=not _large_data):
             st.caption(
                 "Kategori ve sayısal aralık filtreleri seçildiğinde tüm grafikler "
                 "anında güncellenir."
             )
+            if _large_data:
+                st.caption(
+                    str(
+                        CONFIG.get("GUI", {}).get(
+                            "LARGE_DATA_MODE_CAPTION",
+                            "⚡ Büyük veri: yüksek kardinaliteli sütunlar filtre dışı.",
+                        )
+                    )
+                )
+            max_cat_opts = _max_category_filter_options()
             for cat_col in categorical_for_model[:8]:
                 opts = sorted(
                     analysis_base[cat_col].astype(str).dropna().unique().tolist()
                 )
                 if len(opts) <= 1:
+                    continue
+                if len(opts) > max_cat_opts:
+                    st.caption(
+                        f"**{cat_col}** — {len(opts)} benzersiz değer "
+                        f"(>{max_cat_opts}); performans için filtre atlandı."
+                    )
                     continue
                 picked = st.multiselect(
                     f"{cat_col}",
@@ -2631,9 +2937,30 @@ def main() -> None:
         tab_labels_ui = [f"{ic} {lbl}" for ic, lbl in zip(tab_icons, tab_labels_base)]
     else:
         tab_labels_ui = tab_labels_base
-    tab_raw, tab_stats, tab_clean, tab_analiz, tab_exec = st.tabs(tab_labels_ui)
 
-    with tab_raw:
+    dec = int(fmt["TABLE_FLOAT_DECIMALS"])
+    min_num = int(model["MIN_NUMERIC_FEATURES"])
+    _lazy_tabs = _is_large_dataset(analysis_base)
+    if _lazy_tabs:
+        st.caption(
+            str(
+                CONFIG.get("GUI", {}).get(
+                    "LARGE_DATA_MODE_CAPTION",
+                    "⚡ Büyük veri modu aktif.",
+                )
+            )
+        )
+    _tab_active = st.radio(
+        "Sekme",
+        tab_labels_ui,
+        horizontal=True,
+        key="wv_main_tab_radio",
+        index=min(3, len(tab_labels_ui) - 1),
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    if _tab_active == tab_labels_ui[0]:
         st.markdown("#### Kalite özeti (radar)")
         st.caption(
             "Yönetsel bakış: doluluk, benzersizlik, anomali azlığı (analiz sonrası güncellenir), "
@@ -2677,12 +3004,9 @@ def main() -> None:
             )
         except (ValueError, PreprocessingError, KeyError, TypeError) as exc:
             st.caption(f"Veri sağlığı haritası oluşturulamadı: {exc}")
-        st.dataframe(
-            df.head(int(prev["RAW_CLEAN_HEAD"])),
-            use_container_width=True,
-        )
+        _render_dataframe_preview(df, use_container_width=True)
 
-    with tab_stats:
+    elif _tab_active == tab_labels_ui[1]:
         try:
             stats = loader.get_summary_stats(df)
         except PreprocessingError as exc:
@@ -2706,28 +3030,44 @@ def main() -> None:
             with st.expander("Kategorik üst değerler"):
                 st.json(stats["categorical_top_values"])
 
-    with tab_clean:
+    elif _tab_active == tab_labels_ui[2]:
+        with st.expander("📖 Dinamik Veri Sözlüğü", expanded=False):
+            st.caption(
+                "Data Catalog: yüklü veri setinin sütun adları, çıkarılan tipler ve "
+                "benzersiz değer sayıları."
+            )
+            try:
+                dict_df = _build_data_dictionary_df(analysis_base)
+                st.dataframe(dict_df, use_container_width=True, hide_index=True)
+            except (ValueError, TypeError, KeyError) as exc:
+                st.caption(f"Veri sözlüğü üretilemedi: {exc}")
+
         st.markdown("#### Canlı What-If veri düzenleyicisi")
-        st.caption(
-            "Hücreleri düzenleyin veya satır silin; değişiklik sonrası K-Means, PCA ve "
-            "Random Forest modelleri **otomatik** yeniden çalışır."
-        )
-        editor_df = analysis_base.copy()
-        edited_df = st.data_editor(
-            editor_df,
-            num_rows="dynamic",
-            use_container_width=True,
-            key="wv_whatif_data_editor",
-            hide_index=False,
-        )
-        new_snap = _dataframe_edit_fingerprint(edited_df)
-        old_snap = st.session_state.get(f"{whatif_key}_snap")
-        if old_snap != new_snap:
-            st.session_state[whatif_key] = edited_df.copy()
-            st.session_state[f"{whatif_key}_snap"] = new_snap
-            st.session_state.pop("analiz_result", None)
-            st.session_state["whatif_auto_run"] = True
-            st.rerun()
+        if len(analysis_base) > _whatif_editor_max_rows():
+            st.caption(
+                f"⚡ **{len(analysis_base):,}** satır — What-If editörü performans için "
+                f"devre dışı (>{_whatif_editor_max_rows()} satır). Salt okunur önizleme:"
+            )
+            _render_dataframe_preview(analysis_base, use_container_width=True)
+        else:
+            st.caption(
+                "Hücreleri düzenleyin veya satır silin; değişiklikler kaydedilir. "
+                "K-Means, PCA ve Random Forest yalnızca **Analizi Çalıştır** ile tetiklenir."
+            )
+            edited_df = st.data_editor(
+                analysis_base.copy(),
+                num_rows="dynamic",
+                use_container_width=True,
+                key="wv_whatif_data_editor",
+                hide_index=False,
+            )
+            new_snap = _dataframe_edit_fingerprint(edited_df)
+            old_snap = st.session_state.get(f"{whatif_key}_snap")
+            if old_snap != new_snap:
+                st.session_state[whatif_key] = edited_df.copy()
+                st.session_state[f"{whatif_key}_snap"] = new_snap
+                st.session_state.pop("analiz_result", None)
+                st.rerun()
 
         if cleaned is not None:
             missing_after = int(analysis_base.isna().sum().sum())
@@ -2738,11 +3078,7 @@ def main() -> None:
                 clean_error or "Temizleme uygulanamadı; What-If ham veri üzerinde."
             )
 
-    dec = int(fmt["TABLE_FLOAT_DECIMALS"])
-    head_n = int(prev["ANALYSIS_TABLE_HEAD"])
-    min_num = int(model["MIN_NUMERIC_FEATURES"])
-
-    with tab_analiz:
+    elif _tab_active == tab_labels_ui[3]:
         st.subheader("Analiz Paneli")
         _dm_tab = _data_mode_id(dm_sess)
         if _dm_tab != "tabular":
@@ -2788,14 +3124,14 @@ def main() -> None:
             )
         if not can_run:
             st.warning(msg["WARN_MIN_NUMERIC"])
-        whatif_auto = bool(st.session_state.pop("whatif_auto_run", False))
+        st.session_state.pop("whatif_auto_run", None)
         run = st.button(
             "Analizi Çalıştır",
             type="primary",
             disabled=not can_run,
         )
 
-        if (run or whatif_auto) and can_run:
+        if run and can_run:
             with st.spinner(ui["SPINNER_ANALYSIS"]):
                 pipeline_out = _run_analysis_pipeline(
                     analysis_df,
@@ -2818,9 +3154,6 @@ def main() -> None:
                     time_series_mode and time_column and ts_value_column
                 ),
             }
-            if whatif_auto:
-                st.toast("What-If düzenlemesi uygulandı — modeller yenilendi.", icon="✨")
-
         result: dict[str, Any] | None = st.session_state.get("analiz_result")
         if result is None:
             st.caption(msg["CAPTION_ANALYSIS_EMPTY"])
@@ -2862,6 +3195,11 @@ def main() -> None:
                 top_feature=top_feat,
                 feature_delta=feat_delta,
             )
+            exec_cap = _format_pipeline_execution_caption(
+                result.get("execution_timings")
+            )
+            if exec_cap:
+                st.caption(exec_cap)
             st.divider()
 
             feat_cols = result.get("feature_columns") or selected_numeric
@@ -2906,567 +3244,653 @@ def main() -> None:
                     f"Hedef önemi atlandı: {result['err_target_importance']}"
                 )
 
-            st.markdown("### Akıllı iki değişken analizi")
-            st.caption(
-                "Sütun tiplerine göre otomatik scatter, kutu veya çubuk grafiği seçilir."
-            )
-            smart_cols = list(analysis_base.columns.astype(str))
-            if len(smart_cols) >= 2:
-                sc1, sc2 = st.columns(2)
-                with sc1:
-                    smart_a = st.selectbox(
-                        "Sütun A",
-                        options=smart_cols,
-                        index=0,
-                        key="wv_smart_col_a",
-                    )
-                with sc2:
-                    smart_b_default = 1 if len(smart_cols) > 1 else 0
-                    smart_b = st.selectbox(
-                        "Sütun B",
-                        options=smart_cols,
-                        index=smart_b_default,
-                        key="wv_smart_col_b",
-                    )
-                if smart_a != smart_b:
-                    try:
-                        fig_smart, smart_kind, smart_comment = (
-                            viz.plot_smart_bivariate(
-                                analysis_base,
-                                smart_a,
-                                smart_b,
-                            )
-                        )
-                        _render_decision_banner(
-                            build_bivariate_decision_banner(
-                                analysis_base,
-                                smart_a,
-                                smart_b,
-                                smart_kind,
-                            )
-                        )
-                        _render_plotly_static(
-                            fig_smart, key="wv_plot_smart_bivariate"
-                        )
-                        _render_ai_comment(smart_comment)
-                        _academic_tip_if(
-                            show_academic_tips,
-                            tips_cfg.get("smart_chart", ""),
-                        )
-                    except ValueError as exc:
-                        st.warning(str(exc))
-                else:
-                    st.caption("İki farklı sütun seçin.")
-            else:
-                st.info("Akıllı grafik için en az iki sütun gerekir.")
-
-            st.markdown("### Korelasyon (ısı haritası)")
-            if len(feat_cols) >= min_num:
-                try:
-                    fig_hm = viz.plot_correlation_heatmap(
-                        analysis_df,
-                        numeric_columns=feat_cols,
-                        title=(
-                            f"Korelasyon matrisi (Pearson) — {len(feat_cols)} sayısal sütun"
-                        ),
-                    )
-                    _render_plotly_static(fig_hm, key="wv_plot_corr")
-                    _render_ai_comment(
-                        commentator.correlation_heatmap(analysis_df, feat_cols)
-                    )
-                    _academic_tip_if(
-                        show_academic_tips,
-                        tips_cfg.get("correlation", ""),
-                    )
-                except ValueError as exc:
-                    st.warning(str(exc))
-            else:
-                st.info(
-                    "Korelasyon haritası için en az iki sayısal sütun seçin."
-                )
-
-            st.markdown("### Dirsek yöntemi (inertia eğrisi)")
-            if result.get("err_elbow"):
-                st.warning(f"Dirsek taraması: {result['err_elbow']}")
-            elif result.get("elbow_df") is not None and not result["elbow_df"].empty:
-                try:
-                    fig_e = viz.plot_elbow_curve(
-                        result["elbow_df"],
-                        selected_k=int(n_clusters),
-                        title=(
-                            "Dirsek yöntemi: K vs inertia — "
-                            f"seçilen k = {int(n_clusters)} (turuncu çizgi)"
-                        ),
-                    )
-                    _render_plotly_static(fig_e, key="wv_plot_elbow")
-                    _render_ai_comment(
-                        commentator.elbow(
-                            result["elbow_df"],
-                            int(n_clusters),
-                        )
-                    )
-                    _academic_tip_if(
-                        show_academic_tips,
-                        tips_cfg.get("elbow", ""),
-                    )
-                except ValueError as exc:
-                    st.warning(str(exc))
-
-            st.markdown("### Kümeleme (K-Means)")
-            if result["err_cluster"]:
-                st.error(f"Kümeleme hatası: {result['err_cluster']}")
-            elif result["labels"] is not None:
-                labels = result["labels"]
-                cluster_view = analysis_base.copy()
-                cluster_view.insert(0, "cluster", labels.values)
-                c_met1, c_met2 = st.columns(2)
-                with c_met1:
-                    if result.get("inertia") is not None:
-                        st.metric(
-                            "Inertia (WCSS, ölçeklenmiş özellik uzayında)",
-                            f"{result['inertia']:.4f}",
-                            help="Küme içi kare uzaklıklarının toplamı; düşük olması "
-                            "daha sıkı kümeler demek değildir — k arttıkça genelde düşer.",
-                        )
-                with c_met2:
-                    sil = result.get("silhouette")
-                    if sil is not None:
-                        st.metric(
-                            "Kümeleme başarı notu (Silhouette)",
-                            f"{sil:.3f}",
-                            help="Ölçeklenmiş özellik uzayında, -1 ile 1 arası; 1 değerine "
-                            "yakın kümeler daha iyi ayrışmış demektir. Tek kümede veya k=1 "
-                            "iken hesaplanmaz.",
-                        )
-                    elif result.get("n_clusters", 0) < 2:
-                        st.caption("Silhouette: yalnızca **k ≥ 2** için tanımlıdır.")
-                    else:
-                        st.caption("Silhouette bu veri/küme yapısı için hesaplanamadı.")
-                _academic_tip_if(
-                    show_academic_tips,
-                    tips_cfg.get("clustering", ""),
-                )
-                _render_ai_comment(
-                    commentator.silhouette(
-                        result.get("silhouette"),
-                        int(result.get("n_clusters", n_clusters)),
-                    )
-                )
-                st.write(
-                    f"**{result['n_clusters']}** küme, **{len(labels)}** satır."
-                )
-                st.dataframe(
-                    _style_analysis_dataframe(cluster_view.head(head_n), float_decimals=dec),
-                    use_container_width=True,
-                )
-                counts_df = (
-                    pd.DataFrame({"cluster": labels.values})
-                    .groupby("cluster", sort=True)
-                    .size()
-                    .reset_index(name="count")
-                )
-                st.text("Küme başına satır sayısı:")
-                st.dataframe(
-                    _style_analysis_dataframe(counts_df, float_decimals=dec),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                if feat_cols:
-                    try:
-                        cmeans = _cluster_profile_means(
-                            analysis_base, labels, feat_cols
-                        )
-                        st.markdown("#### Küme profilleri (ortalama)")
-                        st.caption(
-                            "Seçilen sayısal sütunlarda küme başına ortalama "
-                            "(mean); kümelerin profilini karşılaştırmak için."
-                        )
-                        st.dataframe(
-                            _style_analysis_dataframe(
-                                cmeans, float_decimals=dec
-                            ),
-                            use_container_width=True,
-                        )
-                    except (KeyError, TypeError, ValueError) as exc:
-                        st.caption(f"Küme ortalamaları hesaplanamadı: {exc}")
-
-                imp_df = result.get("cluster_importance_df")
-                if isinstance(imp_df, pd.DataFrame) and not imp_df.empty:
-                    st.markdown("#### Küme ayırma önemi (Random Forest — ek)")
-                    st.caption(
-                        "K-Means etiketlerini sınıf kabul eden ek keşifsel önem analizi."
-                    )
-                    try:
-                        fig_imp = viz.plot_cluster_feature_importance(imp_df)
-                        _render_plotly_static(fig_imp, key="wv_plot_cluster_imp")
-                        _render_ai_comment(
-                            commentator.feature_importance(
-                                imp_df, target_name="K-Means kümeleri"
-                            )
-                        )
-                    except ValueError as exc:
-                        st.warning(str(exc))
-                elif result.get("err_importance"):
-                    st.caption(f"Küme önemi atlandı: {result['err_importance']}")
-
-                box_opts = [c for c in feat_cols if c in analysis_base.columns]
-                if box_opts:
-                    st.markdown("#### Kümelere göre kutu grafikleri")
-                    st.caption(
-                        "Seçilen özelliğin her kümedeki medyan ve yayılımı; "
-                        "kümeler arası kutu konumu farkı, segmentasyonu destekler."
-                    )
-                    box_col = st.selectbox(
-                        "Kutu grafiği sütunu",
-                        options=box_opts,
-                        key="wv_cluster_box_col",
-                    )
-                    try:
-                        fig_box = viz.plot_cluster_boxplots(
-                            analysis_base,
-                            box_col,
-                            labels.values,
-                            title=f"{box_col} — küme bazında dağılım",
-                        )
-                        _render_plotly_static(fig_box, key="wv_plot_cluster_box")
-                        box_comment_df = analysis_base.copy()
-                        box_comment_df["Küme"] = labels.astype(int).astype(str)
-                        _render_ai_comment(
-                            commentator.boxplot_by_group(
-                                box_comment_df,
-                                box_col,
-                                "Küme",
-                                group_label="kümede",
-                            )
-                        )
-                    except ValueError as exc:
-                        st.warning(str(exc))
-
-                if result["pca_coords"] is not None:
-                    pca_enriched = result["pca_coords"].join(
-                        analysis_df,
-                        how="left",
-                    )
-                    try:
-                        pv_c = result.get("pca_variance_pct")
-                        fig_c = viz.plot_clustering(
-                            pca_enriched,
-                            labels.values,
-                            variance_explained_pct=float(pv_c)
-                            if pv_c is not None
-                            else None,
-                        )
-                        _render_plotly_interactive(
-                            fig_c,
-                            key="wv_plot_cluster",
-                            selection_base=pca_enriched,
-                            float_decimals=dec,
-                            show_selection_hint=True,
-                        )
-                        if result.get("pca_variance_pct") is not None:
-                            pv = float(result["pca_variance_pct"])
-                            st.info(
-                                "Bu 2 boyutlu görselleştirme, orijinal verideki bilginin "
-                                f"**%{pv:.2f}** kadarını temsil etmektedir "
-                                "(PCA açıklanan varyans oranı; ölçeklenmiş sayısal sütunlar)."
-                            )
-                        _render_ai_comment(
-                            commentator.silhouette(
-                                result.get("silhouette"),
-                                int(result.get("n_clusters", n_clusters)),
-                            )
-                        )
-                    except ValueError as exc:
-                        st.warning(f"Küme grafiği oluşturulamadı: {exc}")
-
-                pca_3d = result.get("pca_coords_3d")
-                if pca_3d is not None and labels is not None:
-                    st.markdown("#### 3D PCA Explorer (PC1 · PC2 · PC3)")
-                    st.caption(
-                        "Fareyle döndürün; küme sınırlarını derinlik algısıyla inceleyin."
-                    )
-                    if result.get("err_pca_3d"):
-                        st.warning(f"3D PCA: {result['err_pca_3d']}")
-                    try:
-                        pca3_enriched = pca_3d.join(analysis_df, how="left")
-                        pv3 = result.get("pca_variance_pct_3d")
-                        fig_3d = viz.plot_3d_pca_clusters(
-                            pca3_enriched,
-                            labels.values,
-                            variance_explained_pct=float(pv3)
-                            if pv3 is not None
-                            else None,
-                            chart_height=680,
-                        )
-                        _render_plotly_static(fig_3d, key="wv_plot_pca_3d")
-                        if pv3 is not None:
-                            _render_ai_comment(
-                                f"PC1+PC2+PC3 ile açıklanan varyans **%{float(pv3):.1f}** "
-                                "(ölçeklenmiş uzay); 3B görünüm bilgi kaybını 2B'ye göre "
-                                "azaltır."
-                            )
-                    except ValueError as exc:
-                        st.warning(f"3D PCA grafiği oluşturulamadı: {exc}")
-
-                st.markdown("#### Manuel sütun kıyaslaması (K-Means renkli)")
+            _viz_lite = _is_large_dataset(analysis_base)
+            if _viz_lite:
                 st.caption(
-                    "İki gerçek özelliği seçin; noktalar K-Means küme rengiyle boyanır "
-                    "(PCA’daki PC1/PC2’den farklı olarak eksenler doğrudan yorumlanır)."
-                )
-                if result.get("use_log_transform"):
-                    st.caption(
-                        "Kümeleme log-dönüşümlü özellikler üzerinde yapıldı; bu grafikte "
-                        "eksiler **orijinal (temizlenmiş) ölçek**tedir."
+                    str(
+                        CONFIG.get("GUI", {}).get(
+                            "HEAVY_CHARTS_HELP",
+                            "Büyük veri: grafikler isteğe bağlı yüklenir.",
+                        )
                     )
-                num_manual, _ = DataLoader.infer_column_types(analysis_base)
-                if len(num_manual) >= 2:
-                    m1, m2 = st.columns(2)
-                    with m1:
-                        mx = st.selectbox(
-                            "X ekseni",
-                            options=num_manual,
+                )
+                _show_heavy_charts = st.toggle(
+                    str(
+                        CONFIG.get("GUI", {}).get(
+                            "HEAVY_CHARTS_TOGGLE",
+                            "📊 Detaylı grafikleri yükle",
+                        )
+                    ),
+                    value=False,
+                    key="wv_load_heavy_charts",
+                )
+            else:
+                _show_heavy_charts = True
+
+            if _viz_lite and not _show_heavy_charts:
+                _render_lite_cluster_summary(
+                    result,
+                    n_clusters=int(n_clusters),
+                    dec=dec,
+                    commentator=commentator,
+                )
+
+            if _show_heavy_charts:
+                st.markdown("### Akıllı iki değişken analizi")
+                st.caption(
+                    "Sütun tiplerine göre otomatik scatter, kutu veya çubuk grafiği seçilir."
+                )
+                smart_cols = list(analysis_base.columns.astype(str))
+                if len(smart_cols) >= 2:
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        smart_a = st.selectbox(
+                            "Sütun A",
+                            options=smart_cols,
                             index=0,
-                            key="wv_manual_scatter_x",
+                            key="wv_smart_col_a",
                         )
-                    with m2:
-                        default_y = 1 if len(num_manual) > 1 else 0
-                        my = st.selectbox(
-                            "Y ekseni",
-                            options=num_manual,
-                            index=default_y,
-                            key="wv_manual_scatter_y",
+                    with sc2:
+                        smart_b_default = 1 if len(smart_cols) > 1 else 0
+                        smart_b = st.selectbox(
+                            "Sütun B",
+                            options=smart_cols,
+                            index=smart_b_default,
+                            key="wv_smart_col_b",
                         )
-                    if mx != my:
+                    if smart_a != smart_b:
                         try:
-                            plot_align = analysis_base.loc[labels.index]
-                            fig_m, man_kind, man_comment = (
+                            smart_df, _, smart_sampled = _sample_for_visualization(
+                                analysis_base
+                            )
+                            fig_smart, smart_kind, smart_comment = (
                                 viz.plot_smart_bivariate(
-                                    plot_align,
-                                    mx,
-                                    my,
-                                    title=f"{mx} vs {my} (akıllı grafik + K-Means)",
-                                    labels=labels.values,
+                                    smart_df,
+                                    smart_a,
+                                    smart_b,
                                 )
                             )
-                            if man_kind == "scatter":
-                                fig_m = viz.plot_manual_cluster_scatter(
-                                    plot_align,
-                                    mx,
-                                    my,
-                                    labels.values,
-                                    title=f"{mx} vs {my} ilişkisi (K-Means renkleri)",
+                            _render_decision_banner(
+                                build_bivariate_decision_banner(
+                                    analysis_base,
+                                    smart_a,
+                                    smart_b,
+                                    smart_kind,
                                 )
-                                _render_plotly_interactive(
-                                    fig_m,
-                                    key="wv_plot_manual_scatter",
-                                    selection_base=plot_align,
-                                    float_decimals=dec,
-                                    show_selection_hint=True,
+                            )
+                            _render_plotly_static(
+                                fig_smart, key="wv_plot_smart_bivariate"
+                            )
+                            if smart_sampled:
+                                st.caption(
+                                    _plot_sample_caption(
+                                        len(smart_df), len(analysis_base)
+                                    )
                                 )
-                            else:
-                                _render_plotly_static(
-                                    fig_m, key="wv_plot_manual_smart"
-                                )
-                            _render_ai_comment(man_comment)
+                            _render_ai_comment(smart_comment)
                             _academic_tip_if(
                                 show_academic_tips,
-                                tips_cfg.get("manual_scatter", ""),
+                                tips_cfg.get("smart_chart", ""),
                             )
                         except ValueError as exc:
-                            st.warning(f"Manuel grafik oluşturulamadı: {exc}")
+                            st.warning(str(exc))
                     else:
-                        st.caption("X ve Y için farklı sütun seçin.")
+                        st.caption("İki farklı sütun seçin.")
                 else:
-                    st.info(
-                        "Manuel kıyaslama için en az iki sayısal sütun gerekir."
-                    )
-            else:
-                st.warning("Küme etiketleri yok.")
+                    st.info("Akıllı grafik için en az iki sütun gerekir.")
 
-            st.markdown(
-                f'### PCA ({model["PCA_COMPONENTS_UI"]} bileşen)'
-            )
-            if result["err_pca"]:
-                st.error(f"PCA hatası: {result['err_pca']}")
-            elif result["pca_coords"] is not None:
-                st.write(
-                    f"İlk {head_n} satır — "
-                    f'PC1…PC{model["PCA_COMPONENTS_UI"]}:'
-                )
-                st.dataframe(
-                    _style_analysis_dataframe(
-                        result["pca_coords"].head(head_n),
-                        float_decimals=dec,
-                    ),
-                    use_container_width=True,
-                )
-                if result.get("pca_variance_pct") is not None:
-                    pv = float(result["pca_variance_pct"])
-                    st.metric(
-                        "PC1 + PC2 ile açıklanan varyans",
-                        f"{pv:.2f}%",
-                        help="Ölçeklenmiş sayısal özellikler üzerinde PCA "
-                        "`explained_variance_ratio_` toplamı.",
-                    )
-                    st.caption(
-                        "Bu 2 boyutlu görselleştirme, orijinal verideki bilginin "
-                        f"%{pv:.2f} kadarını temsil etmektedir."
-                    )
-                _academic_tip_if(
-                    show_academic_tips,
-                    tips_cfg.get("pca", ""),
-                )
-            else:
-                st.warning("PCA koordinatları yok.")
-
-            _render_model_interpreter(result)
-            _academic_tip_if(
-                show_academic_tips,
-                tips_cfg.get("interpreter", ""),
-            )
-
-            st.markdown("### Anomali tespiti (Isolation Forest)")
-            if result["err_anomaly"]:
-                st.error(f"Anomali hatası: {result['err_anomaly']}")
-            elif result["pred"] is not None:
-                pred = result["pred"]
-                anomaly_view = analysis_base.copy()
-                anomaly_view.insert(0, "anomaly_score_label", pred.values)
-                n_out = int((pred.values == -1).sum())
-                n_in = int((pred.values == 1).sum())
-                st.write(
-                    f"Tahmin özeti: **{n_out}** anomali (-1), **{n_in}** normal (1)."
-                )
-                if (
-                    result.get("time_series_mode")
-                    and result.get("time_column")
-                    and result.get("ts_value_column")
-                ):
-                    st.markdown("#### Zaman serisi anomali motoru")
-                    st.caption(
-                        "Sistem logları / sensör verisi: çizgi üzerinde kırmızı sıçrama "
-                        "noktaları Isolation Forest aykırılarını işaretler."
-                    )
-                    tcol = str(result["time_column"])
-                    vcol = str(result["ts_value_column"])
+                st.markdown("### Korelasyon (ısı haritası)")
+                if len(feat_cols) >= min_num:
                     try:
-                        fig_ts = viz.plot_timeseries_anomalies(
-                            analysis_base,
-                            tcol,
-                            vcol,
-                            pred.values,
-                            title=f"Zaman serisi — {vcol} (anomali sıçramaları)",
+                        fig_hm = viz.plot_correlation_heatmap(
+                            analysis_df,
+                            numeric_columns=feat_cols,
+                            title=(
+                                f"Korelasyon matrisi (Pearson) — {len(feat_cols)} sayısal sütun"
+                            ),
                         )
-                        _render_plotly_static(fig_ts, key="wv_plot_timeseries_anom")
+                        _render_plotly_static(fig_hm, key="wv_plot_corr")
                         _render_ai_comment(
-                            f"**{tcol}** ekseninde **{vcol}** izlendi; **{n_out}** anomali "
-                            f"noktası kırmızı sıçrama olarak işaretlendi (~%"
-                            f"{100.0 * n_out / max(1, len(pred)):.1f} oran)."
+                            commentator.correlation_heatmap(analysis_df, feat_cols)
+                        )
+                        _academic_tip_if(
+                            show_academic_tips,
+                            tips_cfg.get("correlation", ""),
                         )
                     except ValueError as exc:
-                        st.warning(f"Zaman serisi grafiği: {exc}")
-                st.dataframe(
-                    _style_analysis_dataframe(
-                        anomaly_view.head(head_n),
-                        float_decimals=dec,
-                    ),
-                    use_container_width=True,
-                )
-                if n_out > 0:
-                    st.markdown("#### Şüpheli kayıtlar ve ‘neden şüpheli?’ özeti")
-                    suspicious = analysis_base.loc[pred == -1]
-                    cmp_tbl, cmp_summary = _anomaly_vs_normal_mean_table(
-                        analysis_base,
-                        pred,
-                        list(feat_cols),
+                        st.warning(str(exc))
+                else:
+                    st.info(
+                        "Korelasyon haritası için en az iki sayısal sütun seçin."
                     )
-                    col_susp, col_why = st.columns(2)
-                    with col_susp:
-                        st.caption(
-                            "Şüpheli kayıtlar listesi — Isolation Forest **-1**; "
-                            "orijinal (log öncesi) ölçek."
-                        )
-                        st.dataframe(
-                            _style_analysis_dataframe(
-                                suspicious, float_decimals=dec
+
+                st.markdown("### Dirsek yöntemi (inertia eğrisi)")
+                if result.get("err_elbow"):
+                    st.warning(f"Dirsek taraması: {result['err_elbow']}")
+                elif result.get("elbow_df") is not None and not result["elbow_df"].empty:
+                    try:
+                        fig_e = viz.plot_elbow_curve(
+                            result["elbow_df"],
+                            selected_k=int(n_clusters),
+                            title=(
+                                "Dirsek yöntemi: K vs inertia — "
+                                f"seçilen k = {int(n_clusters)} (turuncu çizgi)"
                             ),
-                            use_container_width=True,
                         )
-                    with col_why:
-                        st.caption(
-                            "Normal (1) vs anomali (-1) grup ortalamaları — keşifsel karşılaştırma."
+                        _render_plotly_static(fig_e, key="wv_plot_elbow")
+                        _render_ai_comment(
+                            commentator.elbow(
+                                result["elbow_df"],
+                                int(n_clusters),
+                            )
                         )
-                        if not cmp_tbl.empty:
+                        _academic_tip_if(
+                            show_academic_tips,
+                            tips_cfg.get("elbow", ""),
+                        )
+                    except ValueError as exc:
+                        st.warning(str(exc))
+
+                st.markdown("### Kümeleme (K-Means)")
+                if result["err_cluster"]:
+                    st.error(f"Kümeleme hatası: {result['err_cluster']}")
+                elif result["labels"] is not None:
+                    labels = result["labels"]
+                    cluster_view = analysis_base.copy()
+                    cluster_view.insert(0, "cluster", labels.values)
+                    c_met1, c_met2 = st.columns(2)
+                    with c_met1:
+                        if result.get("inertia") is not None:
+                            st.metric(
+                                "Inertia (WCSS, ölçeklenmiş özellik uzayında)",
+                                f"{result['inertia']:.4f}",
+                                help="Küme içi kare uzaklıklarının toplamı; düşük olması "
+                                "daha sıkı kümeler demek değildir — k arttıkça genelde düşer.",
+                            )
+                    with c_met2:
+                        sil = result.get("silhouette")
+                        if sil is not None:
+                            st.metric(
+                                "Kümeleme başarı notu (Silhouette)",
+                                f"{sil:.3f}",
+                                help="Ölçeklenmiş özellik uzayında, -1 ile 1 arası; 1 değerine "
+                                "yakın kümeler daha iyi ayrışmış demektir. Tek kümede veya k=1 "
+                                "iken hesaplanmaz.",
+                            )
+                        elif result.get("n_clusters", 0) < 2:
+                            st.caption("Silhouette: yalnızca **k ≥ 2** için tanımlıdır.")
+                        else:
+                            st.caption("Silhouette bu veri/küme yapısı için hesaplanamadı.")
+                    _academic_tip_if(
+                        show_academic_tips,
+                        tips_cfg.get("clustering", ""),
+                    )
+                    _render_ai_comment(
+                        commentator.silhouette(
+                            result.get("silhouette"),
+                            int(result.get("n_clusters", n_clusters)),
+                        )
+                    )
+                    st.write(
+                        f"**{result['n_clusters']}** küme, **{len(labels)}** satır."
+                    )
+                    _render_styled_dataframe_preview(
+                        cluster_view,
+                        float_decimals=dec,
+                    )
+                    counts_df = (
+                        pd.DataFrame({"cluster": labels.values})
+                        .groupby("cluster", sort=True)
+                        .size()
+                        .reset_index(name="count")
+                    )
+                    st.text("Küme başına satır sayısı:")
+                    st.dataframe(
+                        _style_analysis_dataframe(counts_df, float_decimals=dec),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    if feat_cols:
+                        try:
+                            cmeans = _cluster_profile_means(
+                                analysis_base, labels, feat_cols
+                            )
+                            st.markdown("#### Küme profilleri (ortalama)")
+                            st.caption(
+                                "Seçilen sayısal sütunlarda küme başına ortalama "
+                                "(mean); kümelerin profilini karşılaştırmak için."
+                            )
                             st.dataframe(
                                 _style_analysis_dataframe(
-                                    cmp_tbl, float_decimals=dec
+                                    cmeans, float_decimals=dec
                                 ),
                                 use_container_width=True,
                             )
-                        st.info(cmp_summary)
-                        _academic_tip_if(
-                            show_academic_tips,
-                            tips_cfg.get("anomaly_character", ""),
+                        except (KeyError, TypeError, ValueError) as exc:
+                            st.caption(f"Küme ortalamaları hesaplanamadı: {exc}")
+
+                    imp_df = result.get("cluster_importance_df")
+                    if isinstance(imp_df, pd.DataFrame) and not imp_df.empty:
+                        st.markdown("#### Küme ayırma önemi (Random Forest — ek)")
+                        st.caption(
+                            "K-Means etiketlerini sınıf kabul eden ek keşifsel önem analizi."
+                        )
+                        try:
+                            fig_imp = viz.plot_cluster_feature_importance(imp_df)
+                            _render_plotly_static(fig_imp, key="wv_plot_cluster_imp")
+                            _render_ai_comment(
+                                commentator.feature_importance(
+                                    imp_df, target_name="K-Means kümeleri"
+                                )
+                            )
+                        except ValueError as exc:
+                            st.warning(str(exc))
+                    elif result.get("err_importance"):
+                        st.caption(f"Küme önemi atlandı: {result['err_importance']}")
+
+                    box_opts = [c for c in feat_cols if c in analysis_base.columns]
+                    if box_opts:
+                        st.markdown("#### Kümelere göre kutu grafikleri")
+                        st.caption(
+                            "Seçilen özelliğin her kümedeki medyan ve yayılımı; "
+                            "kümeler arası kutu konumu farkı, segmentasyonu destekler."
+                        )
+                        box_col = st.selectbox(
+                            "Kutu grafiği sütunu",
+                            options=box_opts,
+                            key="wv_cluster_box_col",
+                        )
+                        try:
+                            fig_box = viz.plot_cluster_boxplots(
+                                analysis_base,
+                                box_col,
+                                labels.values,
+                                title=f"{box_col} — küme bazında dağılım",
+                            )
+                            _render_plotly_static(fig_box, key="wv_plot_cluster_box")
+                            box_comment_df = analysis_base.copy()
+                            box_comment_df["Küme"] = labels.astype(int).astype(str)
+                            _render_ai_comment(
+                                commentator.boxplot_by_group(
+                                    box_comment_df,
+                                    box_col,
+                                    "Küme",
+                                    group_label="kümede",
+                                )
+                            )
+                        except ValueError as exc:
+                            st.warning(str(exc))
+
+                    if result["pca_coords"] is not None:
+                        pca_enriched = result["pca_coords"].join(
+                            analysis_df,
+                            how="left",
+                        )
+                        try:
+                            pca_plot_df, lab_plot, pca_sampled = (
+                                _sample_for_visualization(
+                                    pca_enriched, labels.values
+                                )
+                            )
+                            pv_c = result.get("pca_variance_pct")
+                            fig_c = viz.plot_clustering(
+                                pca_plot_df,
+                                lab_plot,
+                                variance_explained_pct=float(pv_c)
+                                if pv_c is not None
+                                else None,
+                            )
+                            _render_plotly_interactive(
+                                fig_c,
+                                key="wv_plot_cluster",
+                                selection_base=pca_plot_df,
+                                float_decimals=dec,
+                                show_selection_hint=not pca_sampled,
+                                force_static=pca_sampled,
+                            )
+                            if pca_sampled:
+                                st.caption(
+                                    _plot_sample_caption(
+                                        len(pca_plot_df), len(pca_enriched)
+                                    )
+                                )
+                            if result.get("pca_variance_pct") is not None:
+                                pv = float(result["pca_variance_pct"])
+                                st.info(
+                                    "Bu 2 boyutlu görselleştirme, orijinal verideki bilginin "
+                                    f"**%{pv:.2f}** kadarını temsil etmektedir "
+                                    "(PCA açıklanan varyans oranı; ölçeklenmiş sayısal sütunlar)."
+                                )
+                            _render_ai_comment(
+                                commentator.silhouette(
+                                    result.get("silhouette"),
+                                    int(result.get("n_clusters", n_clusters)),
+                                )
+                            )
+                        except ValueError as exc:
+                            st.warning(f"Küme grafiği oluşturulamadı: {exc}")
+
+                    pca_3d = result.get("pca_coords_3d")
+                    if pca_3d is not None and labels is not None:
+                        st.markdown("#### 3D PCA Explorer (PC1 · PC2 · PC3)")
+                        st.caption(
+                            "Fareyle döndürün; küme sınırlarını derinlik algısıyla inceleyin."
+                        )
+                        if result.get("err_pca_3d"):
+                            st.warning(f"3D PCA: {result['err_pca_3d']}")
+                        try:
+                            pca3_enriched = pca_3d.join(analysis_df, how="left")
+                            pca3_plot, lab3_plot, pca3_sampled = (
+                                _sample_for_visualization(
+                                    pca3_enriched, labels.values
+                                )
+                            )
+                            pv3 = result.get("pca_variance_pct_3d")
+                            fig_3d = viz.plot_3d_pca_clusters(
+                                pca3_plot,
+                                lab3_plot,
+                                variance_explained_pct=float(pv3)
+                                if pv3 is not None
+                                else None,
+                                chart_height=520 if pca3_sampled else 680,
+                            )
+                            _render_plotly_static(fig_3d, key="wv_plot_pca_3d")
+                            if pca3_sampled:
+                                st.caption(
+                                    _plot_sample_caption(
+                                        len(pca3_plot), len(pca3_enriched)
+                                    )
+                                )
+                            if pv3 is not None:
+                                _render_ai_comment(
+                                    f"PC1+PC2+PC3 ile açıklanan varyans **%{float(pv3):.1f}** "
+                                    "(ölçeklenmiş uzay); 3B görünüm bilgi kaybını 2B'ye göre "
+                                    "azaltır."
+                                )
+                        except ValueError as exc:
+                            st.warning(f"3D PCA grafiği oluşturulamadı: {exc}")
+
+                    st.markdown("#### Manuel sütun kıyaslaması (K-Means renkli)")
+                    st.caption(
+                        "İki gerçek özelliği seçin; noktalar K-Means küme rengiyle boyanır "
+                        "(PCA’daki PC1/PC2’den farklı olarak eksenler doğrudan yorumlanır)."
+                    )
+                    if result.get("use_log_transform"):
+                        st.caption(
+                            "Kümeleme log-dönüşümlü özellikler üzerinde yapıldı; bu grafikte "
+                            "eksiler **orijinal (temizlenmiş) ölçek**tedir."
+                        )
+                    num_manual, _ = DataLoader.infer_column_types(analysis_base)
+                    if len(num_manual) >= 2:
+                        m1, m2 = st.columns(2)
+                        with m1:
+                            mx = st.selectbox(
+                                "X ekseni",
+                                options=num_manual,
+                                index=0,
+                                key="wv_manual_scatter_x",
+                            )
+                        with m2:
+                            default_y = 1 if len(num_manual) > 1 else 0
+                            my = st.selectbox(
+                                "Y ekseni",
+                                options=num_manual,
+                                index=default_y,
+                                key="wv_manual_scatter_y",
+                            )
+                        if mx != my:
+                            try:
+                                plot_align = analysis_base.loc[labels.index]
+                                plot_sub, lab_sub, man_sampled = (
+                                    _sample_for_visualization(
+                                        plot_align, labels.values
+                                    )
+                                )
+                                fig_m, man_kind, man_comment = (
+                                    viz.plot_smart_bivariate(
+                                        plot_sub,
+                                        mx,
+                                        my,
+                                        title=f"{mx} vs {my} (akıllı grafik + K-Means)",
+                                        labels=lab_sub,
+                                    )
+                                )
+                                if man_kind == "scatter":
+                                    fig_m = viz.plot_manual_cluster_scatter(
+                                        plot_sub,
+                                        mx,
+                                        my,
+                                        lab_sub,
+                                        title=f"{mx} vs {my} ilişkisi (K-Means renkleri)",
+                                    )
+                                    _render_plotly_interactive(
+                                        fig_m,
+                                        key="wv_plot_manual_scatter",
+                                        selection_base=plot_sub,
+                                        float_decimals=dec,
+                                        show_selection_hint=not man_sampled,
+                                        force_static=man_sampled,
+                                    )
+                                    if man_sampled:
+                                        st.caption(
+                                            _plot_sample_caption(
+                                                len(plot_sub), len(plot_align)
+                                            )
+                                        )
+                                else:
+                                    _render_plotly_static(
+                                        fig_m, key="wv_plot_manual_smart"
+                                    )
+                                _render_ai_comment(man_comment)
+                                _academic_tip_if(
+                                    show_academic_tips,
+                                    tips_cfg.get("manual_scatter", ""),
+                                )
+                            except ValueError as exc:
+                                st.warning(f"Manuel grafik oluşturulamadı: {exc}")
+                        else:
+                            st.caption("X ve Y için farklı sütun seçin.")
+                    else:
+                        st.info(
+                            "Manuel kıyaslama için en az iki sayısal sütun gerekir."
                         )
                 else:
-                    st.caption("Bu çalıştırmada **-1** etiketli satır yok.")
-                if result["pca_coords"] is not None:
-                    try:
-                        st.caption(CONFIG["PLOTLY"]["CAPTION_SELECTION"])
-                        pv_a = result.get("pca_variance_pct")
-                        fig_a = viz.plot_anomalies(
-                            result["pca_coords"],
-                            pred.values,
-                            variance_explained_pct=float(pv_a)
-                            if pv_a is not None
-                            else None,
-                        )
-                        _render_plotly_interactive(
-                            fig_a,
-                            key="wv_plot_anomaly",
-                            selection_base=analysis_base,
-                            float_decimals=dec,
-                            show_selection_hint=False,
-                        )
-                        _render_ai_comment(
-                            f"Isolation Forest **{n_out}** aykırı (toplam "
-                            f"{len(pred)} gözlemin ~%{100.0 * n_out / max(1, len(pred)):.1f}'i) "
-                            "işaretlemiştir; kırmızı noktalar düşük yoğunluk adaylarıdır."
-                        )
-                        _academic_tip_if(
-                            show_academic_tips,
-                            tips_cfg.get("anomaly", ""),
-                        )
-                    except ValueError as exc:
-                        st.warning(f"Anomali grafiği oluşturulamadı: {exc}")
-            else:
-                st.warning("Anomali tahminleri yok.")
+                    st.warning("Küme etiketleri yok.")
 
-            st.markdown("### Özellik dağılımı")
-            cols_list = list(analysis_base.columns)
-            col_pick = st.selectbox(
-                "Grafik sütunu",
-                options=cols_list,
-                index=0,
-                help="Sayısal: histogram. Kategorik/metin: frekans çubuğu.",
-                key=sess["FEATURE_DIST_COLUMN"],
-            )
-            try:
-                fig_d = viz.plot_feature_distribution(
-                    analysis_base,
-                    col_pick,
-                    title=f"Özellik dağılımı: {col_pick}",
+                st.markdown(
+                    f'### PCA ({model["PCA_COMPONENTS_UI"]} bileşen)'
                 )
-                _render_plotly_static(fig_d, key="wv_plot_feature")
-                _render_ai_comment(
-                    commentator.distribution(analysis_base, col_pick)
-                )
+                if result["err_pca"]:
+                    st.error(f"PCA hatası: {result['err_pca']}")
+                elif result["pca_coords"] is not None:
+                    st.write(
+                        f"İlk {_gui_preview_limit()} satır — "
+                        f'PC1…PC{model["PCA_COMPONENTS_UI"]}:'
+                    )
+                    _render_styled_dataframe_preview(
+                        result["pca_coords"],
+                        float_decimals=dec,
+                    )
+                    if result.get("pca_variance_pct") is not None:
+                        pv = float(result["pca_variance_pct"])
+                        st.metric(
+                            "PC1 + PC2 ile açıklanan varyans",
+                            f"{pv:.2f}%",
+                            help="Ölçeklenmiş sayısal özellikler üzerinde PCA "
+                            "`explained_variance_ratio_` toplamı.",
+                        )
+                        st.caption(
+                            "Bu 2 boyutlu görselleştirme, orijinal verideki bilginin "
+                            f"%{pv:.2f} kadarını temsil etmektedir."
+                        )
+                    _academic_tip_if(
+                        show_academic_tips,
+                        tips_cfg.get("pca", ""),
+                    )
+                else:
+                    st.warning("PCA koordinatları yok.")
+
+                _render_model_interpreter(result)
                 _academic_tip_if(
                     show_academic_tips,
-                    tips_cfg.get("feature_dist", ""),
+                    tips_cfg.get("interpreter", ""),
                 )
-            except ValueError as exc:
-                st.warning(str(exc))
+
+                st.markdown("### Anomali tespiti (Isolation Forest)")
+                if result["err_anomaly"]:
+                    st.error(f"Anomali hatası: {result['err_anomaly']}")
+                elif result["pred"] is not None:
+                    pred = result["pred"]
+                    anomaly_view = analysis_base.copy()
+                    anomaly_view.insert(0, "anomaly_score_label", pred.values)
+                    n_out = int((pred.values == -1).sum())
+                    n_in = int((pred.values == 1).sum())
+                    st.write(
+                        f"Tahmin özeti: **{n_out}** anomali (-1), **{n_in}** normal (1)."
+                    )
+                    if (
+                        result.get("time_series_mode")
+                        and result.get("time_column")
+                        and result.get("ts_value_column")
+                    ):
+                        st.markdown("#### Zaman serisi anomali motoru")
+                        st.caption(
+                            "Sistem logları / sensör verisi: çizgi üzerinde kırmızı sıçrama "
+                            "noktaları Isolation Forest aykırılarını işaretler."
+                        )
+                        tcol = str(result["time_column"])
+                        vcol = str(result["ts_value_column"])
+                        try:
+                            fig_ts = viz.plot_timeseries_anomalies(
+                                analysis_base,
+                                tcol,
+                                vcol,
+                                pred.values,
+                                title=f"Zaman serisi — {vcol} (anomali sıçramaları)",
+                            )
+                            _render_plotly_static(fig_ts, key="wv_plot_timeseries_anom")
+                            _render_ai_comment(
+                                f"**{tcol}** ekseninde **{vcol}** izlendi; **{n_out}** anomali "
+                                f"noktası kırmızı sıçrama olarak işaretlendi (~%"
+                                f"{100.0 * n_out / max(1, len(pred)):.1f} oran)."
+                            )
+                        except ValueError as exc:
+                            st.warning(f"Zaman serisi grafiği: {exc}")
+                    _render_styled_dataframe_preview(
+                        anomaly_view,
+                        float_decimals=dec,
+                    )
+                    if n_out > 0:
+                        st.markdown("#### Şüpheli kayıtlar ve ‘neden şüpheli?’ özeti")
+                        suspicious = analysis_base.loc[pred == -1]
+                        cmp_tbl, cmp_summary = _anomaly_vs_normal_mean_table(
+                            analysis_base,
+                            pred,
+                            list(feat_cols),
+                        )
+                        col_susp, col_why = st.columns(2)
+                        with col_susp:
+                            st.caption(
+                                "Şüpheli kayıtlar listesi — Isolation Forest **-1**; "
+                                "orijinal (log öncesi) ölçek."
+                            )
+                            _render_styled_dataframe_preview(
+                                suspicious,
+                                float_decimals=dec,
+                            )
+                        with col_why:
+                            st.caption(
+                                "Normal (1) vs anomali (-1) grup ortalamaları — keşifsel karşılaştırma."
+                            )
+                            if not cmp_tbl.empty:
+                                st.dataframe(
+                                    _style_analysis_dataframe(
+                                        cmp_tbl, float_decimals=dec
+                                    ),
+                                    use_container_width=True,
+                                )
+                            st.info(cmp_summary)
+                            _academic_tip_if(
+                                show_academic_tips,
+                                tips_cfg.get("anomaly_character", ""),
+                            )
+                    else:
+                        st.caption("Bu çalıştırmada **-1** etiketli satır yok.")
+                    if result["pca_coords"] is not None:
+                        try:
+                            anom_pca, anom_pred, anom_sampled = _sample_for_visualization(
+                                result["pca_coords"], pred.values
+                            )
+                            if not anom_sampled:
+                                st.caption(CONFIG["PLOTLY"]["CAPTION_SELECTION"])
+                            pv_a = result.get("pca_variance_pct")
+                            fig_a = viz.plot_anomalies(
+                                anom_pca,
+                                anom_pred,
+                                variance_explained_pct=float(pv_a)
+                                if pv_a is not None
+                                else None,
+                            )
+                            _render_plotly_interactive(
+                                fig_a,
+                                key="wv_plot_anomaly",
+                                selection_base=anom_pca,
+                                float_decimals=dec,
+                                show_selection_hint=False,
+                                force_static=anom_sampled,
+                            )
+                            if anom_sampled:
+                                st.caption(
+                                    _plot_sample_caption(
+                                        len(anom_pca), len(result["pca_coords"])
+                                    )
+                                )
+                            _render_ai_comment(
+                                f"Isolation Forest **{n_out}** aykırı (toplam "
+                                f"{len(pred)} gözlemin ~%{100.0 * n_out / max(1, len(pred)):.1f}'i) "
+                                "işaretlemiştir; kırmızı noktalar düşük yoğunluk adaylarıdır."
+                            )
+                            _academic_tip_if(
+                                show_academic_tips,
+                                tips_cfg.get("anomaly", ""),
+                            )
+                        except ValueError as exc:
+                            st.warning(f"Anomali grafiği oluşturulamadı: {exc}")
+                else:
+                    st.warning("Anomali tahminleri yok.")
+
+                st.markdown("### Özellik dağılımı")
+                cols_list = list(analysis_base.columns)
+                col_pick = st.selectbox(
+                    "Grafik sütunu",
+                    options=cols_list,
+                    index=0,
+                    help="Sayısal: histogram. Kategorik/metin: frekans çubuğu.",
+                    key=sess["FEATURE_DIST_COLUMN"],
+                )
+                try:
+                    dist_df, _, dist_sampled = _sample_for_visualization(
+                        analysis_base
+                    )
+                    fig_d = viz.plot_feature_distribution(
+                        dist_df,
+                        col_pick,
+                        title=f"Özellik dağılımı: {col_pick}",
+                    )
+                    _render_plotly_static(fig_d, key="wv_plot_feature")
+                    if dist_sampled:
+                        st.caption(
+                            _plot_sample_caption(len(dist_df), len(analysis_base))
+                        )
+                    _render_ai_comment(
+                        commentator.distribution(analysis_base, col_pick)
+                    )
+                    _academic_tip_if(
+                        show_academic_tips,
+                        tips_cfg.get("feature_dist", ""),
+                    )
+                except ValueError as exc:
+                    st.warning(str(exc))
 
             if _data_mode_id(dm_sess) == "text_corpus":
                 _wc_blob = st.session_state.get(sess["TEXT_CORPUS_BLOB"])
@@ -3641,7 +4065,7 @@ def main() -> None:
             )
             st.markdown(strategy_md)
 
-    with tab_exec:
+    elif _tab_active == tab_labels_ui[4]:
         st.markdown("# Yönetici özeti")
         st.caption(
             "Sunum modu: Silhouette, PCA varyansı, anomali sayısı, kümeleme ve "

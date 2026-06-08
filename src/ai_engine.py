@@ -22,6 +22,7 @@ Matematiksel özeti
 
 from __future__ import annotations
 
+import time
 from typing import Any, Final
 
 import numpy as np
@@ -59,6 +60,12 @@ class AIEngine:
                 (aynı veri-tekrar üretilebilir sonuç).
         """
         self._random_state: Final[int] = random_state
+        self._execution_timings: dict[str, float] = {}
+
+    @property
+    def execution_timings(self) -> dict[str, float]:
+        """Son çağrılarda ölçülen model eğitim süreleri (saniye)."""
+        return dict(self._execution_timings)
 
     def _prepare_data(
         self,
@@ -229,7 +236,9 @@ class AIEngine:
                 random_state=self._random_state,
                 n_init=10,
             )
+            t0 = time.perf_counter()
             labels = model.fit_predict(X)
+            self._execution_timings["kmeans"] = time.perf_counter() - t0
             inertia = float(model.inertia_)
 
             silhouette: float | None = None
@@ -315,7 +324,9 @@ class AIEngine:
                 max_depth=max_depth,
                 class_weight="balanced_subsample",
             )
+            t0 = time.perf_counter()
             rf.fit(X, y)
+            self._execution_timings["rf_cluster"] = time.perf_counter() - t0
             imp = np.asarray(rf.feature_importances_, dtype=np.float64)
             s = float(np.sum(imp))
             if s > 0:
@@ -425,7 +436,9 @@ class AIEngine:
                     "Hedef değişkende en az iki farklı değer gerekir."
                 )
 
+            t0 = time.perf_counter()
             model.fit(X_scaled, y_train)
+            self._execution_timings["rf_target"] = time.perf_counter() - t0
             imp = np.asarray(model.feature_importances_, dtype=np.float64)
             s = float(np.sum(imp))
             if s > 0:
